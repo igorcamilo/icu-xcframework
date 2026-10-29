@@ -56,6 +56,8 @@ option: `--minimum-ios`, `--minimum-macos`, `--minimum-maccatalyst`,
 `--minimum-tvos`, `--minimum-watchos`, and `--minimum-visionos`. Required SDKs must
 be installed. The script probes the compiler's effective minimum for each slice
 and records it in the manifest; a platform/architecture mismatch fails the build.
+Use `--platforms ios --variants ios-simulator` to build just one variant, as the
+release workflow does for each independent build job.
 
 `--simulator-architectures arm64` builds
 only the Apple silicon Simulator slices if Intel support is unnecessary. Source
@@ -64,14 +66,15 @@ the artifact destination has no such restriction. Select another Xcode using
 `DEVELOPER_DIR` as usual.
 
 The script builds native macOS generators, cross-builds each destination, combines
-archive members with `libtool -static`, merges only the Simulator architectures
-with `lipo`, and packages the libraries with `xcodebuild -create-xcframework`.
+archive members with `libtool -static`, merges architectures within each platform
+variant with `lipo`, and packages the libraries with `xcodebuild -create-xcframework`.
 Native Mach-O objects are preserved, without LTO or an intermediate `ld -r` link.
 Builds are cached under `build/`, keyed by source commit, compiler, SDKs,
 deployment target, flags, architectures, and data-filter contents. Per-stage logs,
 consumer executables and link maps remain in that cache for inspection.
-Two architecture builds run concurrently by default and share the `--jobs`
-budget. Use `--parallel-builds 1` to serialize them. This covers Apple application
+Two architecture builds run concurrently by default and share the entire `--jobs`
+budget, including any remainder when the CPU count is odd. Use
+`--parallel-builds 1` to serialize them. This covers Apple application
 platforms; DriverKit/kernel extension environments are not targets of this build.
 
 ## Using the artifact
@@ -224,10 +227,23 @@ status is reflected in that run's result.
 Repository rules must allow the bot to push submodule commits and create tags.
 Enable Actions and put the workflows on the repository's default branch.
 
-The publisher uses GitHub's `xcode-27` macOS runner, which includes the required
-Apple SDKs. Set the `MACOS_RUNNER` repository variable to use a different suitable
-runner. Builds are verified before publishing, and diagnostic logs are kept as
-workflow artifacts for seven days.
+The build matrix runs up to ten macOS jobs concurrently: iOS device/Simulator,
+macOS, Mac Catalyst, tvOS device/Simulator, watchOS device/Simulator, and visionOS
+device/Simulator. Each job uses all runner CPUs and builds its architectures in
+parallel, then runs the full verification for that variant. GitHub account and
+runner availability can limit how many jobs start at once.
+
+The final publishing job downloads all verified parts and assembles one
+XCFramework. It rejects missing variants, mismatched sources/toolchains, changed
+headers and failed verification results. It checks that assembly preserves every
+static library and header byte-for-byte, and combines the verification reports
+without repeating the consumer builds on a single runner. Variant artifacts are
+kept for one day and reused when retrying only failed jobs; diagnostic logs are
+kept for seven days.
+
+Build and publishing jobs use GitHub's `xcode-27` macOS runner, which includes the
+required Apple SDKs. Set the `MACOS_RUNNER` repository variable to use a different
+suitable runner.
 
 Release automation has dependency-free tests that also run in
 [CI](.github/workflows/ci.yml):

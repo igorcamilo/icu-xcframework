@@ -16,7 +16,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from apple_platforms import PLATFORMS, version
+from apple_platforms import PLATFORMS, build_matrix, version
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "icu" / "icu4c" / "source"
@@ -67,6 +67,8 @@ def make_targets(args, sdk_paths, clang):
         for family in args.platforms:
             minimum = getattr(args, "minimum_" + family)
             for variant, sdk, sdk_target, architectures in PLATFORMS[family]["variants"]:
+                if args.variants and variant not in args.variants:
+                    continue
                 settings = json.loads((Path(sdk_paths[sdk]) / "SDKSettings.json").read_text())
                 supported = settings["SupportedTargets"][sdk_target]
                 if minimum not in supported["ValidDeploymentTargets"]:
@@ -107,6 +109,9 @@ def main():
                         help="persistent build/cache directory (no whitespace)")
     parser.add_argument("--platforms", nargs="+", choices=list(PLATFORMS), default=list(PLATFORMS),
                         help="Apple app platforms to include (default: all)")
+    parser.add_argument("--variants", nargs="+",
+                        choices=[entry["variant"] for entry in build_matrix()["include"]],
+                        help="limit the build to specific device, Simulator or Mac variants")
     for family, settings in PLATFORMS.items():
         parser.add_argument("--minimum-" + family, default=settings["minimum"])
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 4, 8))
@@ -126,6 +131,11 @@ def main():
     if args.jobs < 1 or args.parallel_builds < 1:
         parser.error("--jobs and --parallel-builds must be positive")
     args.platforms = list(dict.fromkeys(args.platforms))
+    if args.variants:
+        available = {variant for family in args.platforms
+                     for variant, _, _, _ in PLATFORMS[family]["variants"]}
+        if not set(args.variants) <= available:
+            parser.error("requested variants must belong to the selected platforms")
     for family in args.platforms:
         if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", getattr(args, "minimum_" + family)):
             parser.error("minimum deployment versions must have the form 15.0")
@@ -213,7 +223,7 @@ def main():
         build_triple = capture("sh", str(SOURCE / "config.guess"))
         workers = min(args.parallel_builds, args.jobs, len(targets))
 
-        def build_target(target):
+        def build_target(target, jobs):
             directory = work / f"{target['variant']}-{target['arch']}"
             flags = f"-target {target['triple']} -isysroot {sdk_paths[target['sdk']]}"
             target_env = dict(env, CFLAGS=f"{config['cflags']} {flags}",
@@ -221,15 +231,23 @@ def main():
             cpu = "x86_64" if target["arch"] == "x86_64" else "aarch64"
             build(directory, target_env,
                   [*OPTIONS, "--disable-tools", f"--build={build_triple}",
-                   f"--host={cpu}-apple-darwin", f"--with-cross-build={host}"], max(1, args.jobs // workers))
+                   f"--host={cpu}-apple-darwin", f"--with-cross-build={host}"], jobs)
             run([tools["libtool"], "-static", "-o", str(directory / "libICU.a"),
                  *[str(directory / "lib" / name) for name in
                    ("libicui18n.a", "libicuuc.a", "libicudata.a")]],
                 work, directory / "combine.log", env)
 
+        def build_group(targets, jobs):
+            for target in targets:
+                build_target(target, jobs)
+
         with ThreadPoolExecutor(max_workers=workers) as pool:
             failures = []
-            futures = [pool.submit(build_target, target) for target in targets]
+            # Fixed worker budgets use every requested CPU without exceeding
+            # --jobs when faster builds finish before their neighbors.
+            budget, remainder = divmod(args.jobs, workers)
+            futures = [pool.submit(build_group, targets[index::workers],
+                                   budget + (index < remainder)) for index in range(workers)]
             for future in as_completed(futures):
                 try:
                     future.result()

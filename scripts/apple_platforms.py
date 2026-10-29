@@ -29,5 +29,11 @@ XCFRAMEWORK_PLATFORMS = {
 }
 
 
+def build_matrix():
+    return {"include": [{"family": family, "variant": variant}
+                        for family, settings in PLATFORMS.items()
+                        for variant, _, _, _ in settings["variants"]]}
+
+
 def version(value):
     return tuple(map(int, (value + ".0.0").split(".")[:3]))
