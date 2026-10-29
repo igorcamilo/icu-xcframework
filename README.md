@@ -187,26 +187,34 @@ creates a matching repository tag (for example, `release-79.1`), and creates a
 draft release. Bot commits use subjects such as `⬆️ Update ICU to 79.1`, validated
 to be under 50 Unicode characters with no trailing period. It also bootstraps a
 release for the currently pinned ICU version when this repository has not
-published it yet.
+published it yet. Every manual run continues to the build and publishing jobs,
+even when the latest upstream release is already complete. When the submodule
+revision is unchanged, no commit is created and the existing tag is preserved.
 
 [Publish XCFramework](.github/workflows/release.yml) is called directly by the
 manual release-check workflow and also runs for manually published repository releases.
-It checks out the release tag, builds and verifies one XCFramework containing all
+It uses the build scripts from the workflow run's commit and the ICU revision
+pinned by the release tag. It builds and verifies one XCFramework containing all
 supported Apple app platforms, and uploads these GitHub release assets:
 
 - `ICU.xcframework.zip`, with exactly one `ICU.xcframework` at the archive root.
 - `ICU.xcframework.zip.sha256`, with the ZIP's SHA-256 checksum.
 
-Only after both assets are uploaded does it update the release description with
+Only after both assets are uploaded does it refresh the release title to
+`ICU <version>` and update the release description with
 the upstream release-notes link and a `.binaryTarget(name:url:checksum:)` snippet
 using that release's exact download URL and checksum. Draft releases are then
 published. Existing maintainer-written description text is preserved.
 
-Start **Publish XCFramework** manually with an existing release tag to retry a
-failed run. An uploaded ZIP is reused rather than replaced, including when a
-previous attempt failed between uploading it and updating the description. This
-keeps binary target URLs and checksums stable. Running **Check ICU releases**
-again also retries an unfinished release while that version is still current.
+Start **Publish XCFramework** manually with an existing release tag to rebuild
+that version. Both manual entry points always build and replace the ZIP and
+checksum assets, then regenerate the title and managed description. The download
+URL stays the same, but the checksum can change; Swift package consumers must
+use the newly generated snippet after replacement. Choose the branch containing
+your build-script improvements when starting a manual run.
+
+Release-event runs reuse an existing ZIP and checksum when retrying a partial
+publish. Reusable workflow callers can request replacement with `rebuild: true`.
 
 The workflows use `GITHUB_TOKEN` with `contents: write`; no PAT is required. The
 release-check workflow calls the reusable publishing workflow because releases

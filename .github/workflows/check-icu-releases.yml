@@ -28,12 +28,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: python3 -B scripts/release.py check-upstream --branch "$DEFAULT_BRANCH"
+        run: python3 -B scripts/release.py check-upstream --branch "$DEFAULT_BRANCH" --rebuild
 
   publish:
     needs: check
     if: needs.check.outputs.publish == 'true'
-    # Same-repository workflow paths are relative to the repository root.
-    uses: ./.github/workflows/release.yml
+    uses: igorcamilo/icu-xcframework/.github/workflows/release.yml@main
     with:
       tag: ${{ needs.check.outputs.tag }}
+      rebuild: true

@@ -59,9 +59,9 @@ class GitHub:
         return next((release for release in self.releases(repository)
                      if release["tag_name"] == tag), None)
 
-    def upload(self, repository, tag, path):
-        # Never replace an existing binary: the published URL/checksum must stay stable.
-        run("gh", "release", "upload", tag, str(path), "--repo", repository)
+    def upload(self, repository, tag, path, replace=False):
+        options = ["--clobber"] if replace else []
+        run("gh", "release", "upload", tag, str(path), "--repo", repository, *options)
 
     def download(self, repository, tag, name, directory):
         run("gh", "release", "download", tag, "--repo", repository,
@@ -119,7 +119,7 @@ def submodule_commit_message(version):
     return subject
 
 
-def check_upstream(github, repository, branch):
+def check_upstream(github, repository, branch, rebuild=False):
     run("git", "check-ref-format", f"refs/heads/{branch}")
     if run("git", "status", "--porcelain"):
         raise RuntimeError("Release discovery requires a clean checkout")
@@ -130,7 +130,7 @@ def check_upstream(github, repository, branch):
         outputs(tag=tag, publish="false")
         return
     existing = github.release(repository, tag)
-    if release_version(tag) == current and existing and complete(existing):
+    if not rebuild and release_version(tag) == current and existing and complete(existing):
         outputs(tag=tag, publish="false")
         return
 
@@ -167,7 +167,7 @@ def check_upstream(github, repository, branch):
             "tag_name": tag, "target_commitish": run("git", "rev-parse", "HEAD"),
             "name": f"ICU {version}", "body": "", "draft": True, "prerelease": False,
         })
-    outputs(tag=tag, publish="false" if existing and complete(existing) else "true")
+    outputs(tag=tag, publish="true" if rebuild or not (existing and complete(existing)) else "false")
 
 
 def validate_artifact(manifest, verification, source_sha):
@@ -248,12 +248,13 @@ Consumers supply any bridges they need for upstream C++ APIs.
     return body.rstrip() + ("\n\n" if body.strip() else "") + notes
 
 
-def publish(github, repository, tag, artifact, directory):
+def publish(github, repository, tag, artifact, directory, rebuild=False):
     release = github.release(repository, tag)
     if release is None:
         raise RuntimeError("Create the repository release before publishing its artifact")
+    version = icu_version()
     candidates = [r for r in github.releases(UPSTREAM)
-                  if release_version(r["tag_name"]) == release_version("release-" + icu_version())
+                  if release_version(r["tag_name"]) == release_version("release-" + version)
                   and not r["draft"] and not r["prerelease"]]
     if len(candidates) != 1:
         raise RuntimeError("Cannot identify exactly one stable upstream release for this ICU version")
@@ -266,7 +267,7 @@ def publish(github, repository, tag, artifact, directory):
     directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="icu-release-", dir=directory) as temporary:
         staging = Path(temporary)
-        if ARCHIVE in names:
+        if ARCHIVE in names and not rebuild:
             archive = github.download(repository, tag, ARCHIVE, staging)
             with zipfile.ZipFile(archive) as existing:
                 validate_artifact(json.loads(existing.read("ICU.xcframework/BuildManifest.json")),
@@ -278,20 +279,21 @@ def publish(github, repository, tag, artifact, directory):
         # Check SwiftPM's own checksum implementation against the value in the snippet.
         if run("swift", "package", "compute-checksum", archive, cwd=staging) != digest:
             raise RuntimeError("SwiftPM checksum disagrees with the archive SHA-256")
-        if ARCHIVE not in names:
-            github.upload(repository, tag, archive)
-        if CHECKSUM in names:
+        if rebuild or ARCHIVE not in names:
+            github.upload(repository, tag, archive, replace=rebuild)
+        if CHECKSUM in names and not rebuild:
             previous = github.download(repository, tag, CHECKSUM, staging).read_text().split()
             if not previous or previous[0] != digest:
                 raise RuntimeError("The existing checksum asset disagrees with the existing archive")
         else:
             sidecar = staging / CHECKSUM
             sidecar.write_text(f"{digest}  {ARCHIVE}\n")
-            github.upload(repository, tag, sidecar)
+            github.upload(repository, tag, sidecar, replace=rebuild)
         # Only publish drafts after both uploads; preserve manually written release text.
         current = github.release(repository, tag)
         body = release_notes(repository, tag, upstream, digest, current.get("body"))
-        github.api(f"repos/{repository}/releases/{current['id']}", "PATCH", {"body": body, "draft": False})
+        github.api(f"repos/{repository}/releases/{current['id']}", "PATCH",
+                   {"name": f"ICU {version}", "body": body, "draft": False})
         (directory / "release-notes.md").write_text(body)
         print(f"Published {repository} {tag}: {digest}")
 
@@ -302,18 +304,22 @@ def main():
     subcommands = parser.add_subparsers(dest="command", required=True)
     check = subcommands.add_parser("check-upstream")
     check.add_argument("--branch", required=True)
+    check.add_argument("--rebuild", action="store_true",
+                       help="publish even when the current upstream release is complete")
     inspect = subcommands.add_parser("inspect")
     inspect.add_argument("--tag", required=True)
     release = subcommands.add_parser("publish")
     release.add_argument("--tag", required=True)
     release.add_argument("--artifact", type=Path, default=ROOT / "dist/ICU.xcframework")
     release.add_argument("--output-dir", type=Path, default=ROOT / "dist")
+    release.add_argument("--rebuild", action="store_true",
+                         help="replace existing release assets with the verified local build")
     args = parser.parse_args()
     if not args.repo or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
         parser.error("set GH_REPO or --repo to owner/repository")
     github = GitHub()
     if args.command == "check-upstream":
-        check_upstream(github, args.repo, args.branch)
+        check_upstream(github, args.repo, args.branch, rebuild=args.rebuild)
     else:
         if args.tag.startswith("-"):
             parser.error("release tags must not start with a dash")
@@ -324,7 +330,8 @@ def main():
                 raise RuntimeError("Release not found")
             outputs(archive_exists=str(any(a["name"] == ARCHIVE for a in release.get("assets", []))).lower())
         else:
-            publish(github, args.repo, args.tag, args.artifact.resolve(), args.output_dir.resolve())
+            publish(github, args.repo, args.tag, args.artifact.resolve(), args.output_dir.resolve(),
+                    rebuild=args.rebuild)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ class FakeGitHub:
         self.current = {"id": 123, "draft": True, "body": "Maintainer notes", "assets": []}
         self.assets = {}
         self.events = []
+        self.uploads = []
 
     def release(self, repository, tag):
         return copy.deepcopy(self.current)
@@ -46,12 +47,14 @@ class FakeGitHub:
     def releases(self, repository):
         return [upstream()]
 
-    def upload(self, repository, tag, path):
-        if path.name in self.assets:
+    def upload(self, repository, tag, path, replace=False):
+        if path.name in self.assets and not replace:
             raise AssertionError("An existing asset would have been overwritten")
         self.events.append(path.name)
+        self.uploads.append((path.name, replace))
+        if path.name not in self.assets:
+            self.current["assets"].append({"name": path.name})
         self.assets[path.name] = path.read_bytes()
-        self.current["assets"].append({"name": path.name})
 
     def download(self, repository, tag, name, directory):
         path = directory / name
@@ -75,6 +78,20 @@ def fake_command(*args, **kwargs):
 
 
 class ReleaseTests(unittest.TestCase):
+
+    @patch.object(release, "run")
+    def test_upload_only_clobbers_assets_when_requested(self, run):
+        github = release.GitHub()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "ICU.xcframework.zip"
+            path.write_bytes(b"archive")
+            github.upload("owner/repo", "release-79.1", path)
+            self.assertNotIn("--clobber", run.call_args.args)
+            github.upload("owner/repo", "release-79.1", path, replace=True)
+            self.assertEqual(run.call_args.args,
+                             ("gh", "release", "upload", "release-79.1", str(path),
+                              "--repo", "owner/repo", "--clobber"))
+
     def test_published_release_lookup_does_not_list_releases(self):
         github = release.GitHub()
         published = dict(upstream(), id=123)
@@ -173,6 +190,52 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(github.current["body"].count(release.BEGIN), 1)
 
     @patch.object(release, "icu_version", return_value="79.1")
+    @patch.object(release, "run", side_effect=fake_command)
+    def test_rebuild_replaces_both_assets_and_refreshes_title_and_notes(self, run, version):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifact, _, _ = fixture_artifact(directory)
+            github = FakeGitHub()
+            release.publish(github, "owner/repo", "release-79.1", artifact, directory / "first")
+            original_archive = github.assets[release.ARCHIVE]
+            github.current["name"] = "Old title"
+            old_checksum = hashlib.sha256(original_archive).hexdigest()
+            (artifact / "new-toolchain-build").write_text("rebuilt with current scripts")
+            github.events.clear()
+            github.uploads.clear()
+            with patch.object(github, "download", side_effect=AssertionError("must use rebuilt artifact")):
+                release.publish(github, "owner/repo", "release-79.1", artifact,
+                                directory / "rebuilt", rebuild=True)
+            self.assertEqual(github.events, [release.ARCHIVE, release.CHECKSUM, "PATCH"])
+            self.assertEqual(github.uploads, [(release.ARCHIVE, True), (release.CHECKSUM, True)])
+            self.assertNotEqual(github.assets[release.ARCHIVE], original_archive)
+            digest = hashlib.sha256(github.assets[release.ARCHIVE]).hexdigest()
+            self.assertIn(digest, github.current["body"])
+            self.assertNotIn(old_checksum, github.current["body"])
+            self.assertEqual(github.assets[release.CHECKSUM].decode().split()[0], digest)
+            self.assertEqual(github.current["name"], "ICU 79.1")
+            self.assertTrue(github.current["body"].startswith("Maintainer notes\n\n"))
+            self.assertEqual(github.current["body"].count(release.BEGIN), 1)
+            self.assertFalse(github.current["draft"])
+
+    @patch.object(release, "icu_version", return_value="79.1")
+    @patch.object(release, "run", side_effect=fake_command)
+    def test_invalid_rebuild_does_not_replace_existing_assets(self, run, version):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            artifact, _, _ = fixture_artifact(directory)
+            github = FakeGitHub()
+            release.publish(github, "owner/repo", "release-79.1", artifact, directory / "first")
+            original_assets = dict(github.assets)
+            (artifact / "Verification.json").write_text('{"slices": []}')
+            github.events.clear()
+            with self.assertRaisesRegex(RuntimeError, "verification is incomplete"):
+                release.publish(github, "owner/repo", "release-79.1", artifact,
+                                directory / "rebuilt", rebuild=True)
+            self.assertEqual(github.assets, original_assets)
+            self.assertEqual(github.events, [])
+
+    @patch.object(release, "icu_version", return_value="79.1")
     @patch.object(release, "outputs")
     @patch.object(release, "run", return_value="")
     def test_completed_release_check_is_a_noop(self, run, outputs, version):
@@ -182,6 +245,22 @@ class ReleaseTests(unittest.TestCase):
         release.check_upstream(github, "owner/repo", "main")
         outputs.assert_called_once_with(tag="release-79.1", publish="false")
         self.assertFalse(any("push" in call.args or "commit" in call.args for call in run.call_args_list))
+
+    @patch.object(release, "icu_version", return_value="79.1")
+    @patch.object(release, "outputs")
+    @patch.object(release.subprocess, "run", return_value=SimpleNamespace(returncode=0))
+    @patch.object(release, "run", side_effect=fake_command)
+    def test_rebuild_of_completed_release_publishes_without_commits_or_tag_changes(self, run, diff, outputs, version):
+        github = Mock()
+        github.releases.return_value = [upstream()]
+        github.release.return_value = {"draft": False, "body": release.BEGIN + release.END,
+                                       "assets": [{"name": release.ARCHIVE}, {"name": release.CHECKSUM}]}
+        github.api.return_value = {"object": {"sha": "existing-snapshot"}}
+        release.check_upstream(github, "owner/repo", "main", rebuild=True)
+        outputs.assert_called_once_with(tag="release-79.1", publish="true")
+        self.assertFalse(any("push" in call.args or "commit" in call.args or "tag" in call.args
+                             for call in run.call_args_list))
+        self.assertFalse(any(len(c.args) > 1 and c.args[1] == "POST" for c in github.api.call_args_list))
 
     @patch.object(release, "icu_version", return_value="80.1")
     @patch.object(release, "outputs")
