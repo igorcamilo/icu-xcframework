@@ -175,3 +175,55 @@ artifact independently:
 The optional `--host-build` verifier argument accepts the native `host/` directory
 from the build cache to repeat macOS runtime checks. The Simulator must be running
 on an architecture included in the artifact.
+
+## Automated releases
+
+[Check ICU releases](.github/workflows/check-icu-releases.yml) runs only when
+started manually through **Actions → Check ICU releases → Run workflow**.
+It checks stable GitHub releases in
+`unicode-org/icu`, ignores drafts/prereleases and avoids downgrades. When an update
+is available it commits only the `icu` submodule revision to the default branch,
+creates a matching repository tag (for example, `release-79.1`), and creates a
+draft release. Bot commits use subjects such as `⬆️ Update ICU to 79.1`, validated
+to be under 50 Unicode characters with no trailing period. It also bootstraps a
+release for the currently pinned ICU version when this repository has not
+published it yet.
+
+[Publish XCFramework](.github/workflows/release.yml) is called directly by the
+manual release-check workflow and also runs for manually published repository releases.
+It checks out the release tag, builds and verifies one XCFramework containing all
+supported Apple app platforms, and uploads these GitHub release assets:
+
+- `ICU.xcframework.zip`, with exactly one `ICU.xcframework` at the archive root.
+- `ICU.xcframework.zip.sha256`, with the ZIP's SHA-256 checksum.
+
+Only after both assets are uploaded does it update the release description with
+the upstream release-notes link and a `.binaryTarget(name:url:checksum:)` snippet
+using that release's exact download URL and checksum. Draft releases are then
+published. Existing maintainer-written description text is preserved.
+
+Start **Publish XCFramework** manually with an existing release tag to retry a
+failed run. An uploaded ZIP is reused rather than replaced, including when a
+previous attempt failed between uploading it and updating the description. This
+keeps binary target URLs and checksums stable. Running **Check ICU releases**
+again also retries an unfinished release while that version is still current.
+
+The workflows use `GITHUB_TOKEN` with `contents: write`; no PAT is required. The
+release-check workflow calls the reusable publishing workflow because releases
+created with `GITHUB_TOKEN` do not trigger another release-event workflow. The
+publisher runs as a dependent job in the same workflow run, so its build/publish
+status is reflected in that run's result.
+Repository rules must allow the bot to push submodule commits and create tags.
+Enable Actions and put the workflows on the repository's default branch.
+
+The publisher uses GitHub's `xcode-27` macOS runner, which includes the required
+Apple SDKs. Set the `MACOS_RUNNER` repository variable to use a different suitable
+runner. Builds are verified before publishing, and diagnostic logs are kept as
+workflow artifacts for seven days.
+
+Release automation has dependency-free tests that also run in
+[CI](.github/workflows/ci.yml):
+
+```sh
+python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+```

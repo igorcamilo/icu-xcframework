@@ -1,0 +1,39 @@
+name: Check ICU releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: check-icu-releases
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      publish: ${{ steps.upstream.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          submodules: recursive
+      - name: Update submodule, tag the snapshot, and create a draft release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: python3 -B scripts/release.py check-upstream --branch "$DEFAULT_BRANCH"
+
+  publish:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    # Same-repository workflow paths are relative to the repository root.
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.check.outputs.tag }}

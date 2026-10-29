@@ -1,0 +1,62 @@
+name: Publish XCFramework
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing repository release tag to build or retry
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ${{ vars.MACOS_RUNNER || 'xcode-27' }}
+    timeout-minutes: 240
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag || github.event.release.tag_name }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Inspect existing release assets
+        id: release
+        run: python3 -B scripts/release.py inspect --tag "$RELEASE_TAG"
+      - name: Show selected Apple toolchain
+        if: steps.release.outputs.archive_exists != 'true'
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+      - name: Build and verify one XCFramework for all Apple app platforms
+        if: steps.release.outputs.archive_exists != 'true'
+        run: python3 -B scripts/build-icu.py --jobs 3 --parallel-builds 1
+      - name: Upload release assets and update release notes
+        run: python3 -B scripts/release.py publish --tag "$RELEASE_TAG"
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/**/*.log
+            dist/release-notes.md
+            dist/ICU.xcframework/Verification.json
+          if-no-files-found: ignore
+          retention-days: 7
