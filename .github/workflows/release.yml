@@ -38,22 +38,20 @@ jobs:
     timeout-minutes: 10
     outputs:
       build: ${{ env.REBUILD == 'true' || steps.release.outputs.archive_exists != 'true' }}
-      source: ${{ steps.source.outputs.commit }}
+      source: ${{ steps.release.outputs.source_commit }}
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          fetch-tags: false
+          submodules: false
+          sparse-checkout: scripts
           persist-credentials: false
-      - name: Resolve the ICU revision pinned by the release tag
-        id: source
-        run: |
-          git check-ref-format "refs/tags/$RELEASE_TAG"
-          git fetch --depth=1 origin "refs/tags/$RELEASE_TAG"
-          echo "commit=$(git rev-parse FETCH_HEAD:icu)" >> "$GITHUB_OUTPUT"
       - name: Inspect existing release assets
         id: release
-        run: python3 -B scripts/release.py inspect --tag "$RELEASE_TAG"
+        run: python3 -B scripts/release.py inspect --tag "$RELEASE_TAG" --resolve-source
       - name: Plan independent platform variants
         id: matrix
         run: |
@@ -76,19 +74,30 @@ jobs:
       max-parallel: 10
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      ICU_COMMIT: ${{ needs.prepare.outputs.source }}
       ICU_FAMILY: ${{ matrix.family }}
       ICU_VARIANT: ${{ matrix.variant }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
-          submodules: recursive
+          fetch-depth: 1
+          fetch-tags: false
+          submodules: false
+          sparse-checkout: |
+            scripts
+            tests/consumers
           persist-credentials: false
-      - name: Select the release's ICU source
-        run: |
-          git -C icu fetch --depth=1 origin "$ICU_COMMIT"
-          git -C icu checkout --detach "$ICU_COMMIT"
+      - name: Check out only the exact ICU commit and ICU4C subtree
+        uses: actions/checkout@v7
+        with:
+          repository: unicode-org/icu
+          ref: ${{ needs.prepare.outputs.source }}
+          path: icu
+          fetch-depth: 1
+          fetch-tags: false
+          submodules: false
+          sparse-checkout: icu4c
+          persist-credentials: false
       - name: Show selected Apple toolchain
         run: |
           xcodebuild -version
@@ -125,19 +134,16 @@ jobs:
       (needs.build.result == 'success' || needs.prepare.outputs.build != 'true')
     runs-on: ${{ vars.MACOS_RUNNER || 'xcode-27' }}
     timeout-minutes: 30
-    env:
-      ICU_COMMIT: ${{ needs.prepare.outputs.source }}
     steps:
       - uses: actions/checkout@v7
         with:
           # Keep current build/release tooling when rebuilding an older tag.
           ref: ${{ github.workflow_sha }}
-          submodules: recursive
+          fetch-depth: 1
+          fetch-tags: false
+          submodules: false
+          sparse-checkout: scripts
           persist-credentials: false
-      - name: Select the release's ICU source
-        run: |
-          git -C icu fetch --depth=1 origin "$ICU_COMMIT"
-          git -C icu checkout --detach "$ICU_COMMIT"
       - name: Download verified platform variants
         if: needs.prepare.outputs.build == 'true'
         uses: actions/download-artifact@v8

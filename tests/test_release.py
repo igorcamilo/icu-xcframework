@@ -1,8 +1,10 @@
 import copy
+import base64
 import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -47,6 +49,12 @@ class FakeGitHub:
     def releases(self, repository):
         return [upstream()]
 
+    def submodule_commit(self, repository, ref):
+        return "abc123"
+
+    def tag_commit(self, repository, tag):
+        return "abc123"
+
     def upload(self, repository, tag, path, replace=False):
         if path.name in self.assets and not replace:
             raise AssertionError("An existing asset would have been overwritten")
@@ -78,6 +86,95 @@ def fake_command(*args, **kwargs):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_shallow_checker_updates_gitlink_without_an_icu_checkout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            seed, origin, checkout = (root / name for name in ("seed", "origin.git", "checkout"))
+            seed.mkdir()
+            def git(directory, *args):
+                return subprocess.check_output(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                                "-C", str(directory), *args], stderr=subprocess.PIPE, text=True).strip()
+            old_sha, new_sha = "1" * 40, "2" * 40
+            git(seed, "init", "-b", "main")
+            (seed / ".gitmodules").write_text('[submodule "icu"]\n\tpath = icu\n\turl = https://github.com/unicode-org/icu.git\n')
+            (seed / "scripts").mkdir()
+            (seed / "scripts/tool.py").write_text("# tooling\n")
+            git(seed, "add", ".gitmodules", "scripts")
+            git(seed, "update-index", "--add", "--cacheinfo", f"160000,{old_sha},icu")
+            git(seed, "commit", "-m", "Initial source pin")
+            git(root, "clone", "--bare", str(seed), str(origin))
+            git(origin, "config", "uploadpack.allowFilter", "true")
+            git(root, "clone", "--depth=1", "--no-tags", "--filter=blob:none", "--sparse", origin.as_uri(), str(checkout))
+            git(checkout, "sparse-checkout", "set", "scripts")
+            self.assertEqual(git(checkout, "rev-list", "--count", "HEAD"), "1")
+
+            class MetadataGitHub:
+                current = None
+                def releases(self, repository):
+                    return [upstream()]
+                def release(self, repository, tag):
+                    return self.current
+                def tag_commit(self, repository, tag):
+                    return new_sha
+                def submodule_commit(self, repository, ref):
+                    return git(origin, "rev-parse", ref + ":icu")
+                def api(self, endpoint, method="GET", data=None, **kwargs):
+                    if "/contents/" in endpoint:
+                        version = "78.3" if endpoint.endswith(old_sha) else "79.1"
+                        return {"content": base64.b64encode(f'#define U_ICU_VERSION "{version}"\n'.encode()).decode()}
+                    if "/git/ref/tags/" in endpoint:
+                        tag = endpoint.rsplit("/", 1)[-1]
+                        if git(origin, "tag", "--list", tag):
+                            return {"object": {"type": "commit", "sha": git(origin, "rev-parse", tag)}}
+                        return None
+                    if method == "POST":
+                        self.current = dict(data, assets=[])
+                        return self.current
+                    raise AssertionError(endpoint)
+
+            github = MetadataGitHub()
+            real_run = release.run
+            with patch.object(release, "ROOT", checkout), \
+                    patch.object(release, "run", side_effect=lambda *args, **kwargs: real_run(*args, cwd=checkout)) as run, \
+                    patch.object(release, "outputs") as outputs:
+                release.check_upstream(github, "owner/repo", "main", rebuild=True)
+                first = git(checkout, "rev-parse", "HEAD")
+                self.assertEqual(git(checkout, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "icu")
+                self.assertEqual(git(origin, "rev-parse", "main:icu"), new_sha)
+                self.assertEqual(git(origin, "rev-parse", "release-79.1:icu"), new_sha)
+                release.check_upstream(github, "owner/repo", "main", rebuild=True)
+                self.assertEqual(git(checkout, "rev-parse", "HEAD"), first)
+                outputs.assert_called_with(tag="release-79.1", publish="true")
+                self.assertFalse(any("fetch" in c.args or "checkout" in c.args for c in run.call_args_list))
+            self.assertFalse((checkout / "icu/.git").exists())
+            self.assertFalse(git(checkout, "status", "--porcelain"))
+            result = subprocess.run(["git", "-C", str(checkout), "cat-file", "-e", new_sha], capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_gitlink_is_resolved_using_only_contents_metadata(self):
+        github = release.GitHub()
+        with patch.object(github, "api", return_value={"sha": "abc123", "submodule_git_url": "https://github.com/unicode-org/icu.git"}) as api:
+            self.assertEqual(github.submodule_commit("owner/repo", "release-79.1"), "abc123")
+            api.assert_called_once_with("repos/owner/repo/contents/icu?ref=release-79.1")
+        with patch.object(github, "api", return_value={"sha": "a-directory"}), self.assertRaises(RuntimeError):
+            github.submodule_commit("owner/repo", "main")
+
+    def test_upstream_tag_resolution_supports_lightweight_and_annotated_tags(self):
+        github = release.GitHub()
+        commit = {"type": "commit", "sha": "abc123"}
+        with patch.object(github, "api", return_value={"object": commit}) as api:
+            self.assertEqual(github.tag_commit("unicode-org/icu", "release-79.1"), "abc123")
+            self.assertEqual(api.call_count, 1)
+        with patch.object(github, "api", side_effect=[{"object": {"type": "tag", "sha": "annotated"}}, {"object": commit}]) as api:
+            self.assertEqual(github.tag_commit("unicode-org/icu", "release-79.1"), "abc123")
+            self.assertEqual(api.call_args.args, ("repos/unicode-org/icu/git/tags/annotated",))
+
+    def test_version_lookup_downloads_only_the_header_at_the_exact_commit(self):
+        github = release.GitHub()
+        header = '#define U_ICU_VERSION "79.1"\n'
+        with patch.object(github, "api", return_value={"content": base64.b64encode(header.encode()).decode()}) as api:
+            self.assertEqual(release.icu_version("abc123", github), "79.1")
+            api.assert_called_once_with("repos/unicode-org/icu/contents/icu4c/source/common/unicode/uvernum.h?ref=abc123")
 
     @patch.object(release, "run")
     def test_upload_only_clobbers_assets_when_requested(self, run):
@@ -188,6 +285,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(github.events, ["PATCH"])
             self.assertEqual(github.assets[release.ARCHIVE], original)
             self.assertEqual(github.current["body"].count(release.BEGIN), 1)
+            self.assertFalse(any(c.args[0] == "git" for c in run.call_args_list))
 
     @patch.object(release, "icu_version", return_value="79.1")
     @patch.object(release, "run", side_effect=fake_command)
@@ -256,6 +354,8 @@ class ReleaseTests(unittest.TestCase):
         github.release.return_value = {"draft": False, "body": release.BEGIN + release.END,
                                        "assets": [{"name": release.ARCHIVE}, {"name": release.CHECKSUM}]}
         github.api.return_value = {"object": {"sha": "existing-snapshot"}}
+        github.tag_commit.return_value = "abc123"
+        github.submodule_commit.return_value = "abc123"
         release.check_upstream(github, "owner/repo", "main", rebuild=True)
         outputs.assert_called_once_with(tag="release-79.1", publish="true")
         self.assertFalse(any("push" in call.args or "commit" in call.args or "tag" in call.args
@@ -282,6 +382,8 @@ class ReleaseTests(unittest.TestCase):
         github.releases.return_value = [upstream()]
         github.release.return_value = {"draft": True, "assets": [], "body": ""}
         github.api.return_value = {"object": {"sha": "existing-snapshot"}}
+        github.tag_commit.return_value = "abc123"
+        github.submodule_commit.return_value = "abc123"
         release.check_upstream(github, "owner/repo", "main")
         self.assertFalse(any("push" in call.args or "commit" in call.args for call in run.call_args_list))
         self.assertFalse(any(len(c.args) > 1 and c.args[1] == "POST" for c in github.api.call_args_list))
@@ -296,10 +398,13 @@ class ReleaseTests(unittest.TestCase):
         github.releases.return_value = [upstream()]
         github.release.return_value = None
         github.api.return_value = None
+        github.tag_commit.return_value = "abc123"
+        run.side_effect = lambda *args, **kwargs: "old456" if args == ("git", "rev-parse", "HEAD:icu") else fake_command(*args, **kwargs)
         release.check_upstream(github, "owner/repo", "main")
         commits = [call.args for call in run.call_args_list if "commit" in call.args]
         self.assertEqual(len(commits), 1)
-        self.assertEqual(commits[0][-2:], ("--", "icu"))
+        run.assert_any_call("git", "update-index", "--cacheinfo", "160000,abc123,icu")
+        self.assertFalse(any("fetch" in c.args or "checkout" in c.args for c in run.call_args_list))
         message = commits[0][commits[0].index("-m") + 1]
         self.assertEqual(message, "⬆️ Update ICU to 79.1")
         self.assertLess(len(message), 50)

@@ -233,6 +233,15 @@ device/Simulator. Each job uses all runner CPUs and builds its architectures in
 parallel, then runs the full verification for that variant. GitHub account and
 runner availability can limit how many jobs start at once.
 
+All CI checkouts explicitly fetch one commit with no tags or recursive submodules.
+Sparse checkout uses a blob-filtered fetch and downloads only the paths needed by
+that job. Each build job checks out ICU directly at the exact release commit,
+limited to the `icu4c` subtree; it never fetches the submodule's default branch or
+the workflow commit's older ICU revision first. Checking, preparation, publishing
+and unit-test jobs do not check out ICU. Release discovery updates the gitlink in
+the index, and version/provenance checks use GitHub metadata and the single version
+header at the pinned commit instead of fetching Git history or another source tree.
+
 The final publishing job downloads all verified parts and assembles one
 XCFramework. It rejects missing variants, mismatched sources/toolchains, changed
 headers and failed verification results. It checks that assembly preserves every

@@ -2,6 +2,7 @@
 """Discover upstream ICU releases and publish verified XCFramework release assets."""
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -59,6 +60,25 @@ class GitHub:
         return next((release for release in self.releases(repository)
                      if release["tag_name"] == tag), None)
 
+    def submodule_commit(self, repository, ref):
+        entry = self.api(f"repos/{repository}/contents/icu?ref={quote(ref, safe='')}")
+        if not isinstance(entry, dict) or not entry.get("submodule_git_url"):
+            raise RuntimeError("The repository ref does not pin an ICU submodule")
+        return entry["sha"]
+
+    def tag_commit(self, repository, tag):
+        reference = self.api(f"repos/{repository}/git/ref/tags/{quote(tag, safe='')}")
+        target = reference["object"]
+        seen = set()
+        while target["type"] == "tag":
+            if target["sha"] in seen:
+                raise RuntimeError("Cyclic annotated tag")
+            seen.add(target["sha"])
+            target = self.api(f"repos/{repository}/git/tags/{target['sha']}")["object"]
+        if target["type"] != "commit":
+            raise RuntimeError("Release tag must point to a commit")
+        return target["sha"]
+
     def upload(self, repository, tag, path, replace=False):
         options = ["--clobber"] if replace else []
         run("gh", "release", "upload", tag, str(path), "--repo", repository, *options)
@@ -85,8 +105,9 @@ def stable_release(releases):
     return max(releases, key=lambda r: release_version(r["tag_name"]))
 
 
-def icu_version():
-    header = (ROOT / "icu/icu4c/source/common/unicode/uvernum.h").read_text()
+def icu_version(commit, github):
+    entry = github.api(f"repos/{UPSTREAM}/contents/icu4c/source/common/unicode/uvernum.h?ref={quote(commit, safe='')}")
+    header = base64.b64decode(entry["content"]).decode("utf-8")
     match = re.search(r'^\s*#\s*define\s+U_ICU_VERSION\s+"([0-9.]+)"', header, re.M)
     if match is None:
         raise RuntimeError("Cannot read the ICU version from upstream uvernum.h")
@@ -125,7 +146,9 @@ def check_upstream(github, repository, branch, rebuild=False):
         raise RuntimeError("Release discovery requires a clean checkout")
     upstream = stable_release(github.releases(UPSTREAM))
     tag = upstream["tag_name"]
-    current = release_version("release-" + icu_version())
+    pinned_sha = run("git", "rev-parse", "HEAD:icu")
+    current_version = icu_version(pinned_sha, github)
+    current = release_version("release-" + current_version)
     if release_version(tag) < current:
         outputs(tag=tag, publish="false")
         return
@@ -134,30 +157,28 @@ def check_upstream(github, repository, branch, rebuild=False):
         outputs(tag=tag, publish="false")
         return
 
-    run("git", "-C", "icu", "fetch", "--depth=1", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
-    run("git", "-C", "icu", "checkout", "--detach", f"refs/tags/{tag}")
-    version = icu_version()
+    source_sha = github.tag_commit(UPSTREAM, tag)
+    version = current_version if source_sha == pinned_sha else icu_version(source_sha, github)
     if release_version("release-" + version) != release_version(tag):
         raise RuntimeError("Upstream tag and ICU version header disagree")
     message = submodule_commit_message(version)
-    source_sha = run("git", "-C", "icu", "rev-parse", "HEAD")
-    run("git", "add", "--", "icu")
+    # A gitlink records a commit ID; neither the source checkout nor its Git
+    # objects are needed to update it in this initially clean CI index.
+    run("git", "update-index", "--cacheinfo", f"160000,{source_sha},icu")
     changed = subprocess.run(["git", "diff", "--cached", "--quiet", "--", "icu"], cwd=ROOT).returncode
     if changed not in (0, 1):
         raise RuntimeError("Cannot inspect the staged submodule update")
     if changed:
         run("git", "-c", "user.name=github-actions[bot]", "-c",
             "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-            "commit", "--only", "-m", message, "--", "icu")
+            "commit", "-m", message)
         # A concurrent branch update fails instead of force-pushing over it.
         run("git", "push", "origin", f"HEAD:refs/heads/{branch}")
 
     # Create the Git tag explicitly; a draft release alone need not create it.
     reference = github.api(f"repos/{repository}/git/ref/tags/{quote(tag, safe='')}", missing_ok=True)
     if reference:
-        run("git", "fetch", "origin", f"refs/tags/{tag}:refs/tags/{tag}")
-        entry = run("git", "ls-tree", f"refs/tags/{tag}", "--", "icu").split()
-        if len(entry) < 3 or entry[2] != source_sha:
+        if github.submodule_commit(repository, tag) != source_sha:
             raise RuntimeError("Existing release tag pins a different ICU revision; refusing to move it")
     else:
         run("git", "tag", tag, "HEAD")
@@ -252,16 +273,15 @@ def publish(github, repository, tag, artifact, directory, rebuild=False):
     release = github.release(repository, tag)
     if release is None:
         raise RuntimeError("Create the repository release before publishing its artifact")
-    version = icu_version()
+    source_sha = github.submodule_commit(repository, tag)
+    version = icu_version(source_sha, github)
     candidates = [r for r in github.releases(UPSTREAM)
                   if release_version(r["tag_name"]) == release_version("release-" + version)
                   and not r["draft"] and not r["prerelease"]]
     if len(candidates) != 1:
         raise RuntimeError("Cannot identify exactly one stable upstream release for this ICU version")
     upstream = candidates[0]
-    run("git", "-C", "icu", "fetch", "--depth=1", "origin", f"refs/tags/{upstream['tag_name']}")
-    source_sha = run("git", "-C", "icu", "rev-parse", "HEAD")
-    if run("git", "-C", "icu", "rev-parse", "FETCH_HEAD^{commit}") != source_sha:
+    if github.tag_commit(UPSTREAM, upstream["tag_name"]) != source_sha:
         raise RuntimeError("The submodule revision does not match the upstream release tag")
     names = {a["name"] for a in release.get("assets", [])}
     directory.mkdir(parents=True, exist_ok=True)
@@ -308,6 +328,8 @@ def main():
                        help="publish even when the current upstream release is complete")
     inspect = subcommands.add_parser("inspect")
     inspect.add_argument("--tag", required=True)
+    inspect.add_argument("--resolve-source", action="store_true",
+                         help="also resolve the release's ICU gitlink using metadata only")
     release = subcommands.add_parser("publish")
     release.add_argument("--tag", required=True)
     release.add_argument("--artifact", type=Path, default=ROOT / "dist/ICU.xcframework")
@@ -328,7 +350,10 @@ def main():
             release = github.release(args.repo, args.tag)
             if release is None:
                 raise RuntimeError("Release not found")
-            outputs(archive_exists=str(any(a["name"] == ARCHIVE for a in release.get("assets", []))).lower())
+            values = dict(archive_exists=str(any(a["name"] == ARCHIVE for a in release.get("assets", []))).lower())
+            if args.resolve_source:
+                values["source_commit"] = github.submodule_commit(args.repo, args.tag)
+            outputs(**values)
         else:
             publish(github, args.repo, args.tag, args.artifact.resolve(), args.output_dir.resolve(),
                     rebuild=args.rebuild)
