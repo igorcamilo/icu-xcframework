@@ -75,6 +75,29 @@ def fake_command(*args, **kwargs):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_published_release_lookup_does_not_list_releases(self):
+        github = release.GitHub()
+        published = dict(upstream(), id=123)
+        with patch.object(github, "api", return_value=published) as api, \
+                patch.object(github, "releases") as releases:
+            self.assertEqual(github.release("owner/repo", "release-79.1"), published)
+            api.assert_called_once_with("repos/owner/repo/releases/tags/release-79.1", missing_ok=True)
+            releases.assert_not_called()
+
+    def test_draft_release_lookup_falls_back_to_authenticated_listing(self):
+        github = release.GitHub()
+        draft = dict(upstream(), id=123, draft=True)
+        with patch.object(github, "api", return_value=None), \
+                patch.object(github, "releases", return_value=[upstream("release-78.3"), draft]) as releases:
+            self.assertEqual(github.release("owner/repo", "release-79.1"), draft)
+            releases.assert_called_once_with("owner/repo")
+
+    def test_missing_release_lookup_checks_drafts_before_returning_none(self):
+        github = release.GitHub()
+        with patch.object(github, "api", return_value=None), \
+                patch.object(github, "releases", return_value=[upstream("release-78.3")]):
+            self.assertIsNone(github.release("owner/repo", "release-79.1"))
+
     def test_update_commit_subject_follows_create_commits(self):
         message = release.submodule_commit_message("79.1")
         self.assertEqual(message, "⬆️ Update ICU to 79.1")

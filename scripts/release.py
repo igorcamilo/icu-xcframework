@@ -51,7 +51,13 @@ class GitHub:
         return [release for page in pages for release in page]
 
     def release(self, repository, tag):
-        return self.api(f"repos/{repository}/releases/tags/{quote(tag, safe='')}", missing_ok=True)
+        release = self.api(f"repos/{repository}/releases/tags/{quote(tag, safe='')}", missing_ok=True)
+        if release is not None:
+            return release
+        # The tag endpoint only finds published releases. The authenticated
+        # listing also includes drafts when the token has push access.
+        return next((release for release in self.releases(repository)
+                     if release["tag_name"] == tag), None)
 
     def upload(self, repository, tag, path):
         # Never replace an existing binary: the published URL/checksum must stay stable.
