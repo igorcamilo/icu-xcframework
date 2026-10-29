@@ -1,0 +1,10 @@
+import Foundation
+import CxxStdlib
+import ICU4C
+
+// Exercise only declarations provided by ICU's public headers.
+let text = icu_@ICU_MAJOR@.UnicodeString()
+precondition(text.length() == 0)
+let locale = icu_@ICU_MAJOR@.Locale.getEnglish()
+precondition(locale.pointee.isBogus() == 0)
+print("Upstream Swift C++ API tests passed")

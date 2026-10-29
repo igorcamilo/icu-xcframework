@@ -1,0 +1,6 @@
+import Foundation
+import ICU4C
+
+precondition(Data([0x41]).count == 1)
+let text: [UChar] = [0x41, 0x42, 0]
+precondition(text.withUnsafeBufferPointer { u_strlen_@ICU_MAJOR@($0.baseAddress) } == 2)
