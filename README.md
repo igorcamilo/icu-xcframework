@@ -183,8 +183,10 @@ on an architecture included in the artifact.
 
 ## Automated releases
 
-[Check ICU releases](.github/workflows/check-icu-releases.yml) runs only when
-started manually through **Actions → Check ICU releases → Run workflow**.
+[Check ICU releases](.github/workflows/check-icu-releases.yml) runs daily at
+00:00 UTC and can also be started through **Actions → Check ICU releases → Run workflow**.
+Scheduled runs skip completed releases and retry incomplete ones without forcing
+a rebuild or replacing existing assets.
 It checks stable GitHub releases in
 `unicode-org/icu`, ignores drafts/prereleases and avoids downgrades. When an update
 is available it commits only the `icu` submodule revision to the default branch,
@@ -197,7 +199,7 @@ even when the latest upstream release is already complete. When the submodule
 revision is unchanged, no commit is created and the existing tag is preserved.
 
 [Publish XCFramework](.github/workflows/release.yml) is called directly by the
-manual release-check workflow and also runs for manually published repository releases.
+release-check workflow and also runs for manually published repository releases.
 It uses the build scripts from the workflow run's commit and the ICU revision
 pinned by the release tag. It builds and verifies one XCFramework containing all
 supported Apple app platforms, and uploads these GitHub release assets:

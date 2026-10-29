@@ -1,6 +1,8 @@
 name: Check ICU releases
 
 on:
+  schedule:
+    - cron: '0 0 * * *'
   workflow_dispatch:
 
 permissions:
@@ -32,7 +34,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: python3 -B scripts/release.py check-upstream --branch "$DEFAULT_BRANCH" --rebuild
+          REBUILD: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          options=()
+          if [[ "$REBUILD" == "true" ]]; then options+=(--rebuild); fi
+          python3 -B scripts/release.py check-upstream --branch "$DEFAULT_BRANCH" "${options[@]}"
 
   publish:
     needs: check
@@ -40,4 +46,4 @@ jobs:
     uses: igorcamilo/icu-xcframework/.github/workflows/release.yml@main
     with:
       tag: ${{ needs.check.outputs.tag }}
-      rebuild: true
+      rebuild: ${{ github.event_name == 'workflow_dispatch' }}
