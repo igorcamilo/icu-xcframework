@@ -13,6 +13,7 @@ import sys
 
 from apple_platforms import XCFRAMEWORK_PLATFORMS, version
 from job_log import progress, stream_command
+from frameworks import FORMAT, PRIVACY_SHA256, validate as validate_framework
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/consumers"
@@ -49,6 +50,9 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     (work / "results.json").unlink(missing_ok=True)
     manifest = json.loads((artifact / "BuildManifest.json").read_text())
+    require(manifest.get("framework_format") == FORMAT
+            and manifest.get("privacy_manifest_sha256") == PRIVACY_SHA256,
+            "Expected static framework packaging with the current privacy manifest")
     with (artifact / "Info.plist").open("rb") as stream:
         info = plistlib.load(stream)
     report = {"slices": [], "native_runtime": "not requested", "macos_runtime": "not requested",
@@ -68,16 +72,16 @@ def main():
         variant = XCFRAMEWORK_PLATFORMS.get((library["SupportedPlatform"], library.get("SupportedPlatformVariant")))
         require(variant is not None, "Unexpected platform/variant")
         base = artifact / library["LibraryIdentifier"]
-        archive = base / library["LibraryPath"]
-        headers = base / library["HeadersPath"]
+        framework = base / library["LibraryPath"]
+        family = next(t["family"] for t in manifest["targets"] if t["variant"] == variant)
+        archive, headers = validate_framework(framework, family)
         packaged_headers = {p.relative_to(headers).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-                            for p in headers.rglob("*") if p.is_file() and p.name != "module.modulemap"}
+                            for p in headers.rglob("*") if p.is_file()}
         require(packaged_headers == manifest["public_headers_sha256"],
                 "Packaged public headers differ from the unmodified upstream headers")
         require(all(name.startswith("unicode/") for name in packaged_headers),
                 "Custom public headers must not be packaged")
         progress(f"{len(packaged_headers)} public headers match upstream byte-for-byte", variant)
-        require(archive.suffix == ".a", "Expected a static archive")
         major = re.search(r"^#define U_ICU_VERSION_MAJOR_NUM (\d+)$",
                           (headers / "unicode/uvernum.h").read_text(), re.M).group(1)
         actual_archs = set(command("xcrun", "lipo", "-archs", archive).split())
@@ -153,7 +157,7 @@ def main():
             swift_source.write_text((FIXTURES / "import.swift.in").read_text().replace("@ICU_MAJOR@", major))
             command("xcrun", "swiftc", "-target", target["triple"], "-sdk", sdk, "-O",
                     "-Xcc", "-DU_STATIC_IMPLEMENTATION",
-                    "-I", headers, "-module-cache-path", directory / "module-cache",
+                    "-F", framework.parent, "-module-cache-path", directory / "module-cache",
                     swift_source, thin, "-Xlinker", "-dead_strip", "-o", directory / "swift")
             require("_u_strlen_" + major in symbols(directory / "swift"), "Swift did not link packaged ICU")
             cpp_swift_source = directory / "cpp.swift"
@@ -161,12 +165,13 @@ def main():
             command("xcrun", "swiftc", "-target", target["triple"], "-sdk", sdk, "-O",
                     "-cxx-interoperability-mode=default", "-Xcc", "-std=c++17",
                     "-Xcc", "-DU_STATIC_IMPLEMENTATION",
-                    "-I", headers, "-module-cache-path", directory / "cxx-module-cache",
+                    "-F", framework.parent, "-module-cache-path", directory / "cxx-module-cache",
                     cpp_swift_source, thin, "-Xlinker", "-dead_strip", "-o", directory / "swift-cpp")
             report["slices"].append({"variant": variant, "arch": arch, "minimum_os": target["minimum_os"],
                                      "consumer_bytes": sizes, "c_cpp_swift_link": "passed",
                                      "upstream_swift_cpp_link": "passed",
                                      "upstream_public_headers": len(packaged_headers),
+                                     "privacy_manifest": "passed",
                                      "alphabetic_index_cpp_link": "passed",
                                      "alphabetic_index_cpp_bytes": (directory / "alphabetic-index").stat().st_size,
                                      "same_object_dead_stripping": "passed"})
@@ -184,7 +189,10 @@ def main():
             progress("PASS: metadata, upstream headers, static data, C/C++/Swift, AlphabeticIndex and stripping", label)
 
     require(found == expected, "Missing or extra platform/architecture slices")
-    headers = artifact / available[0]["LibraryIdentifier"] / available[0]["HeadersPath"]
+    first_framework = artifact / available[0]["LibraryIdentifier"] / available[0]["LibraryPath"]
+    first_variant = XCFRAMEWORK_PLATFORMS[(available[0]["SupportedPlatform"], available[0].get("SupportedPlatformVariant"))]
+    first_family = next(t["family"] for t in manifest["targets"] if t["variant"] == first_variant)
+    _, headers = validate_framework(first_framework, first_family)
     if args.host_build:
         progress("Running native C/C++/Swift, feature smoke tests and AlphabeticIndex", "native")
         native = work / "native"
@@ -205,14 +213,14 @@ def main():
         swift_source = native / "import.swift"
         swift_source.write_text((FIXTURES / "import.swift.in").read_text().replace("@ICU_MAJOR@", major))
         command("xcrun", "swiftc", "-O", "-Xcc", "-DU_STATIC_IMPLEMENTATION",
-                "-I", headers, "-module-cache-path", native / "module-cache",
+                "-F", first_framework.parent, "-module-cache-path", native / "module-cache",
                 swift_source, *archives, "-Xlinker", "-dead_strip", "-o", native / "swift")
         command(native / "swift")
         cpp_swift_source = native / "cpp.swift"
         cpp_swift_source.write_text((FIXTURES / "cpp.swift.in").read_text().replace("@ICU_MAJOR@", major))
         command("xcrun", "swiftc", "-O", "-cxx-interoperability-mode=default", "-Xcc", "-std=c++17",
                 "-Xcc", "-DU_STATIC_IMPLEMENTATION",
-                "-I", headers, "-module-cache-path", native / "cxx-module-cache",
+                "-F", first_framework.parent, "-module-cache-path", native / "cxx-module-cache",
                 cpp_swift_source, *archives, "-Xlinker", "-dead_strip", "-o", native / "swift-cpp")
         command(native / "swift-cpp")
         report["native_runtime"] = "C/C++/Swift passed; " + (

@@ -115,11 +115,13 @@ jobs:
           python3 -B scripts/build-icu.py \
             --platforms "$ICU_FAMILY" --variants "$ICU_VARIANT" \
             --jobs "$(sysctl -n hw.logicalcpu)" --parallel-builds 2
+      - name: Preserve framework links for transfer
+        run: COPYFILE_DISABLE=1 tar -cf dist/icu-part.tar -C dist ICU.xcframework
       - name: Transfer the verified variant to the publishing job
         uses: actions/upload-artifact@v7
         with:
           name: icu-part-${{ matrix.variant }}
-          path: dist/
+          path: dist/icu-part.tar
           if-no-files-found: error
           overwrite: true
           compression-level: 1

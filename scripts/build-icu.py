@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from apple_platforms import PLATFORMS, build_matrix, version
 from job_log import progress, stream_command
+from frameworks import FORMAT, PRIVACY_SHA256, create as create_framework
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "icu" / "icu4c" / "source"
@@ -281,8 +282,8 @@ def main():
             raise RuntimeError("Installed public headers must exactly match the upstream source headers")
         public_header_hashes = {name: hashlib.sha256(contents).hexdigest()
                                 for name, contents in sorted(upstream_headers.items())}
-        (headers / "module.modulemap").write_text(
-            'module ICU4C [system] {\n  umbrella "unicode"\n  export *\n  link "c++"\n}\n')
+        icu_version = re.search(r'^#define U_ICU_VERSION "([0-9.]+)"',
+                                (headers / "unicode/uvernum.h").read_text(), re.M).group(1)
 
         products = work / "products"
         products.mkdir(exist_ok=True)
@@ -298,7 +299,9 @@ def main():
             else:
                 run([tools["lipo"], "-create", *map(str, thin), "-output", str(archive)],
                     work, product / "lipo.log", env)
-            command += ["-library", str(archive), "-headers", str(headers)]
+            family = next(t["family"] for t in targets if t["variant"] == variant)
+            framework = create_framework(archive, headers, product / "ICU4C.framework", family, icu_version)
+            command += ["-framework", str(framework)]
 
         output.parent.mkdir(parents=True, exist_ok=True)
         # Build/verify alongside the destination so a successful rename stays on one filesystem.
@@ -307,6 +310,7 @@ def main():
             print("Packaging and verifying ICU.xcframework", flush=True)
             run([*command, "-output", str(artifact)], work, work / "package.log", env)
             manifest = dict(config, builder="icu-xcframework",
+                            framework_format=FORMAT, privacy_manifest_sha256=PRIVACY_SHA256,
                             public_headers_sha256=public_header_hashes,
                             consumer_cppflags=["-DU_STATIC_IMPLEMENTATION"],
                             built_at=datetime.now(timezone.utc).isoformat())

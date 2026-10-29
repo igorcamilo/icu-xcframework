@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -17,6 +18,7 @@ import zipfile
 
 from apple_platforms import PLATFORMS
 from job_log import progress, stream_command
+from frameworks import FORMAT, NAME, PRIVACY_SHA256, safe_link
 
 UPSTREAM = "unicode-org/icu"
 ARCHIVE = "ICU.xcframework.zip"
@@ -221,6 +223,8 @@ def validate_artifact(manifest, verification, source_sha):
         raise RuntimeError("Artifact provenance does not match the release's pinned ICU revision")
     if manifest["data_filter_sha256"] is not None:
         raise RuntimeError("Official releases must contain the default, unfiltered ICU data")
+    if manifest.get("framework_format") != FORMAT or manifest.get("privacy_manifest_sha256") != PRIVACY_SHA256:
+        raise RuntimeError("Official releases require static frameworks with the current privacy manifest")
     if {t["family"] for t in manifest["targets"]} != FAMILIES:
         raise RuntimeError("Official releases must include all six Apple app platforms")
     if {t["variant"] for t in manifest["targets"]} != VARIANTS:
@@ -233,6 +237,7 @@ def validate_artifact(manifest, verification, source_sha):
     if expected != actual or any(t["same_object_dead_stripping"] != "passed"
                                  or t["c_cpp_swift_link"] != "passed"
                                  or t["upstream_public_headers"] != len(headers)
+                                 or t.get("privacy_manifest") != "passed"
                                  for t in verification["slices"]):
         raise RuntimeError("Artifact verification is incomplete")
 
@@ -247,9 +252,13 @@ def bundle(artifact, archive, source_sha):
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as target:
         for path in sorted(artifact.rglob("*")):
             if path.is_symlink():
-                raise RuntimeError(f"Unexpected symlink in the release artifact: {path}")
-            if path.is_file():
-                if path.suffix == ".a":
+                link = safe_link(path, artifact)
+                entry = zipfile.ZipInfo(path.relative_to(artifact.parent).as_posix())
+                entry.create_system = 3
+                entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+                target.writestr(entry, link.encode())
+            elif path.is_file():
+                if path.name == NAME:
                     progress(f"Compressing {path.relative_to(artifact)} ({path.stat().st_size:,} bytes)")
                 target.write(path, path.relative_to(artifact.parent).as_posix())
     progress(f"ZIP ready: {archive.stat().st_size:,} bytes")
@@ -289,6 +298,9 @@ to the dependencies of the target that uses it:
 Import `ICU4C`. Configure consumers with `-DU_STATIC_IMPLEMENTATION`
 (Swift: `-Xcc -DU_STATIC_IMPLEMENTATION`) and enable dead-code stripping in Release.
 Consumers supply any bridges they need for upstream C++ APIs.
+
+Each slice is a static framework with its own privacy manifest. Xcode 15 or later
+embeds the framework resources while statically linking and stripping unused code.
 
 [Download the XCFramework]({url}) · SHA-256: `{digest}`
 {END}'''

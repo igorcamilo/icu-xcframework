@@ -13,6 +13,7 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import release
+from frameworks import FORMAT, PRIVACY_SHA256
 
 
 def upstream(tag="release-79.1", **overrides):
@@ -27,10 +28,13 @@ def fixture_artifact(directory):
                for family, settings in release.PLATFORMS.items()
                for variant, _, _, _ in settings["variants"]]
     manifest = {"builder": "icu-xcframework", "source_commit": "abc123",
+                "framework_format": FORMAT, "privacy_manifest_sha256": PRIVACY_SHA256,
                 "data_filter_sha256": None, "targets": targets,
                 "public_headers_sha256": {"unicode/utypes.h": "upstream-hash"}}
     verification = {"slices": [dict(t, same_object_dead_stripping="passed",
                                      c_cpp_swift_link="passed", upstream_public_headers=1) for t in targets]}
+    for item in verification["slices"]:
+        item["privacy_manifest"] = "passed"
     (artifact / "BuildManifest.json").write_text(json.dumps(manifest))
     (artifact / "Verification.json").write_text(json.dumps(verification))
     return artifact, manifest, verification

@@ -3,14 +3,17 @@
 Builds the pinned ICU4C submodule into a self-contained static XCFramework for
 all Apple app platforms, without modifying ICU: iOS, macOS, Mac Catalyst, tvOS,
 watchOS, and visionOS, including all four Simulator families.
-Requires macOS, full Xcode, and Python 3; Xcode's Python is sufficient. No package
-manager dependencies or network access are needed after initializing the submodule.
+Requires macOS, full Xcode 15 or later, and Python 3; Xcode's Python is sufficient.
+No package manager dependencies or network access are needed after initializing
+the submodule.
 
 The artifact exposes only ICU's upstream APIs. Every packaged public header is
 copied unchanged from the submodule and checked byte-for-byte. No custom headers,
 implementations, adapters, aliases, or Swift bindings are added. Generated files
-are limited to packaging metadata: the module map, XCFramework plist, provenance
-manifest and verification report. Consumer-specific bridges belong to consumers.
+are limited to packaging metadata: framework and XCFramework plists, a module map,
+privacy manifests, a provenance manifest and verification report. An include-directory
+symlink lets ICU's original headers resolve their quoted includes within a framework.
+Consumer-specific bridges belong to consumers.
 The public header inventory is discovered from the checked-out submodule on each
 build; there is no maintained list of API declarations or language bindings to
 update for each ICU release.
@@ -67,7 +70,8 @@ the artifact destination has no such restriction. Select another Xcode using
 
 The script builds native macOS generators, cross-builds each destination, combines
 archive members with `libtool -static`, merges architectures within each platform
-variant with `lipo`, and packages the libraries with `xcodebuild -create-xcframework`.
+variant with `lipo`, wraps each archive in a static `ICU4C.framework`, and packages
+the frameworks with `xcodebuild -create-xcframework`.
 Native Mach-O objects are preserved, without LTO or an intermediate `ld -r` link.
 Builds are cached under `build/`, keyed by source commit, compiler, SDKs,
 deployment target, flags, architectures, and data-filter contents. Per-stage logs,
@@ -81,8 +85,15 @@ platforms; DriverKit/kernel extension environments are not targets of this build
 
 ## Using the artifact
 
-Add the XCFramework to the app target as a linked library. Enable
-`DEAD_CODE_STRIPPING=YES` on the app's Release configuration. No ICU-specific
+Add the XCFramework to the app target and select **Embed & Sign** in Xcode's
+Frameworks, Libraries, and Embedded Content settings. Xcode 15 or later links the
+static code into the app and embeds the framework's resources, including its
+privacy manifest. It removes the original static archive from the embedded copy;
+newer Xcode versions may generate a small stub binary for that resource bundle.
+Swift Package Manager consumers use the release's `binaryTarget` snippet.
+Preserve symlinks when copying or repackaging the artifact.
+
+Enable `DEAD_CODE_STRIPPING=YES` on the app's Release configuration. No ICU-specific
 `-force_load` or `-all_load` is needed. The packaged module autolinks `libc++`;
 manual C/C++ consumers that do not use modules should link `-lc++` themselves.
 
@@ -126,6 +137,20 @@ app. Broad runtime tests for the default data set are skipped for custom profile
 provide app-specific runtime tests for those profiles. Ordinary linking, module
 import and code-stripping checks still run.
 
+## Privacy manifest
+
+Every framework slice includes `PrivacyInfo.xcprivacy`, declaring no tracking or
+data collection and the File Timestamp required-reason category with reason
+`C617.1`. ICU's file-mapping implementation calls `stat` to determine file size;
+Apple includes this API in that category even when timestamps are not read.
+The declaration covers access within the app's container, app-group containers,
+and its CloudKit container. Keep custom ICU data-file locations within that scope.
+
+The manifest is a resource and does not change static linking or dead-code stripping.
+ICU's implementation and public headers remain unchanged. See Apple's guidance on
+[privacy manifests](https://developer.apple.com/documentation/bundleresources/adding-a-privacy-manifest-to-your-app-or-third-party-sdk)
+and [required-reason APIs](https://developer.apple.com/documentation/bundleresources/describing-use-of-required-reason-api).
+
 ## Upstream API scope
 
 ICU's C and C++ public APIs are distributed as provided upstream. Swift can use
@@ -142,8 +167,8 @@ data for the indexing locales your app uses.
 
 ## Verification
 
-Every build validates architecture/platform/deployment metadata, real static data,
-C/C++ and Swift+Foundation consumer links for every slice, and dead stripping
+Every build validates architecture/platform/deployment metadata, privacy manifests,
+real static data, C/C++ and Swift+Foundation consumer links for every slice, and dead stripping
 within an ICU object file. It also runs native C/C++/Swift consumers and tests
 properties, normalization, collation, regex, word breaks, legacy conversion, and
 number/date formatting against the packaged headers and native ICU build.
@@ -252,6 +277,8 @@ headers and failed verification results. It checks that assembly preserves every
 static library and header byte-for-byte, and combines the verification reports
 without repeating the consumer builds on a single runner. Variant artifacts are
 kept for one day and reused when retrying only failed jobs.
+CI transfers each part inside a TAR archive, and the final release ZIP also
+preserves framework symlinks and privacy resources.
 
 The main job logs show live configure/compiler/install output, verification
 commands and results, native `AlphabeticIndex` results, assembly checks, upload

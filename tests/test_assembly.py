@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import assemble_icu
 from apple_platforms import PLATFORMS, build_matrix
+from frameworks import FORMAT, PRIVACY_SHA256, create as create_framework
 
 spec = importlib.util.spec_from_file_location("build_icu", Path(assemble_icu.__file__).with_name("build-icu.py"))
 build_icu = importlib.util.module_from_spec(spec)
@@ -32,8 +33,12 @@ def fixture_parts(root):
             (headers / "unicode/utypes.h").write_bytes(header)
             (headers / "module.modulemap").write_text('module ICU4C { umbrella "unicode" }\n')
             (artifact / variant / "libICU.a").write_bytes(b"static library fixture")
+            create_framework(artifact / variant / "libICU.a", headers,
+                             artifact / variant / "ICU4C.framework", family, "79.1")
+            shutil.rmtree(headers)
+            (artifact / variant / "libICU.a").unlink()
             platform = "xros" if family == "visionos" else "ios" if family == "maccatalyst" else family
-            entry = dict(LibraryIdentifier=variant, LibraryPath="libICU.a", HeadersPath="Headers",
+            entry = dict(LibraryIdentifier=variant, LibraryPath="ICU4C.framework",
                          SupportedArchitectures=architectures, SupportedPlatform=platform)
             if family == "maccatalyst":
                 entry["SupportedPlatformVariant"] = "maccatalyst"
@@ -43,13 +48,15 @@ def fixture_parts(root):
             (artifact / "LICENSE").write_text("Upstream license\n")
             targets = [dict(family=family, variant=variant, arch=arch) for arch in architectures]
             manifest = dict(builder="icu-xcframework", recipe=2, source_commit="abc123", xcode="Xcode 27.2",
+                            framework_format=FORMAT, privacy_manifest_sha256=PRIVACY_SHA256,
                             compiler="Apple clang", options=["--enable-static"], cflags="-Os", cxxflags="-Os -std=c++17",
                             cppflags="-DU_STATIC_IMPLEMENTATION", consumer_cppflags=["-DU_STATIC_IMPLEMENTATION"],
                             data_filter_sha256=None, public_headers_sha256={"unicode/utypes.h": hashlib.sha256(header).hexdigest()},
                             targets=targets, sdks={sdk: {"path": "/SDK/" + sdk, "version": "27.2"}},
                             minimum_versions={family: settings["minimum"]})
             verification = dict(slices=[dict(t, c_cpp_swift_link="passed", same_object_dead_stripping="passed",
-                                             upstream_public_headers=1, alphabetic_index_cpp_link="passed") for t in targets],
+                                             upstream_public_headers=1, alphabetic_index_cpp_link="passed",
+                                             privacy_manifest="passed") for t in targets],
                                 native_runtime="passed", macos_runtime="not requested", maccatalyst_runtime="not requested",
                                 alphabetic_index_runtime={"native-cpp": ["passed"]}, simulator_runtime={})
             if family in ("macos", "maccatalyst"):
@@ -85,7 +92,7 @@ class AssemblyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = fixture_parts(root)
-            shutil.copytree(paths["ios"].parent, root / "second-copy")
+            shutil.copytree(paths["ios"].parent, root / "second-copy", symlinks=True)
             with self.assertRaisesRegex(RuntimeError, "duplicate platform"):
                 assemble_icu.collect(root)
             shutil.rmtree(root / "second-copy")
@@ -104,12 +111,12 @@ class AssemblyTests(unittest.TestCase):
                     assemble_icu.collect(root)
 
     def test_rejects_modified_headers_or_module_maps(self):
-        for filename in ("unicode/utypes.h", "module.modulemap"):
+        for filename in ("Headers/unicode/utypes.h", "Modules/module.modulemap"):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 paths = fixture_parts(root)
-                (paths["ios"] / "ios/Headers" / filename).write_text("changed")
-                with self.assertRaisesRegex(RuntimeError, "headers.*(changed|disagree)"):
+                (paths["ios"] / "ios/ICU4C.framework" / filename).write_text("changed")
+                with self.assertRaisesRegex(RuntimeError, "headers.*(changed|disagree)|module map"):
                     assemble_icu.collect(root)
 
     def test_rejects_missing_or_failed_verification(self):
@@ -132,7 +139,7 @@ class AssemblyTests(unittest.TestCase):
             paths = fixture_parts(root / "parts")
             output = root / "ICU.xcframework"
             def architectures(command, **kwargs):
-                variant = Path(command[-1]).parent.name
+                variant = Path(command[-1]).parents[1].name
                 info = plistlib.loads((paths[variant] / "Info.plist").read_bytes())
                 return " ".join(info["AvailableLibraries"][0]["SupportedArchitectures"])
             def package(command, **kwargs):
@@ -140,10 +147,10 @@ class AssemblyTests(unittest.TestCase):
                 destination.mkdir()
                 entries = []
                 for variant, part in paths.items():
-                    shutil.copytree(part / variant, destination / variant)
+                    shutil.copytree(part / variant, destination / variant, symlinks=True)
                     entries.extend(plistlib.loads((part / "Info.plist").read_bytes())["AvailableLibraries"])
                 (destination / "Info.plist").write_bytes(plistlib.dumps({"AvailableLibraries": entries}))
-                (destination / "ios/libICU.a").write_bytes(b"unexpected changes during packaging")
+                (destination / "ios/ICU4C.framework/ICU4C").write_bytes(b"unexpected changes during packaging")
             with patch.object(assemble_icu.subprocess, "check_output", side_effect=architectures), \
                     patch.object(assemble_icu.subprocess, "run", side_effect=package):
                 with self.assertRaisesRegex(RuntimeError, "Assembly changed a verified static library"):

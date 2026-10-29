@@ -13,10 +13,12 @@ import tempfile
 from apple_platforms import XCFRAMEWORK_PLATFORMS, build_matrix
 from release import checksum, validate_artifact
 from job_log import progress
+from frameworks import unpack_parts, validate as validate_framework
 
 COMMON_FIELDS = (
     "builder", "recipe", "source_commit", "xcode", "compiler", "options", "cflags",
     "cxxflags", "cppflags", "data_filter_sha256", "consumer_cppflags", "public_headers_sha256",
+    "framework_format", "privacy_manifest_sha256",
 )
 
 
@@ -31,6 +33,7 @@ def header_hashes(directory):
 
 
 def collect(parts):
+    unpack_parts(parts)
     manifests = sorted(parts.glob("*/ICU.xcframework/BuildManifest.json"))
     require(manifests, "No per-variant XCFramework artifacts found")
     progress(f"Validating {len(manifests)} downloaded platform parts", "assembly")
@@ -65,19 +68,16 @@ def collect(parts):
                 == {(t["variant"], t["arch"]) for t in targets}
                 and len(verification["slices"]) == len(targets), "Part verification is incomplete")
         base = artifact / entry["LibraryIdentifier"]
-        archive = base / entry["LibraryPath"]
-        headers = base / entry["HeadersPath"]
-        require(archive.suffix == ".a" and archive.is_file(), "Missing static library")
+        framework = base / entry["LibraryPath"]
+        _, headers = validate_framework(framework, targets[0]["family"])
         inventory = header_hashes(headers)
-        require({k: v for k, v in inventory.items() if k != "module.modulemap"}
-                == manifest["public_headers_sha256"], "Part public headers changed after verification")
-        require("module.modulemap" in inventory, "Missing module map")
+        require(inventory == manifest["public_headers_sha256"], "Part public headers changed after verification")
         if expected_headers is None:
             expected_headers = inventory
             license_bytes = (artifact / "LICENSE").read_bytes()
         require(inventory == expected_headers and (artifact / "LICENSE").read_bytes() == license_bytes,
-                "Part headers, module maps or licenses disagree")
-        libraries[variant] = (archive, headers, architectures)
+                "Part headers or licenses disagree")
+        libraries[variant] = (framework, headers, architectures)
         progress(f"{variant}: {', '.join(sorted(architectures))}; headers and verification report validated", "assembly")
         combined["targets"].extend(targets)
         for key in ("sdks", "minimum_versions"):
@@ -117,10 +117,12 @@ def assemble(parts, output):
         artifact = Path(temporary) / "ICU.xcframework"
         command = ["xcodebuild", "-create-xcframework"]
         for variant in [entry["variant"] for entry in build_matrix()["include"]]:
-            archive, include, architectures = libraries[variant]
+            framework, include, architectures = libraries[variant]
+            family = next(t["family"] for t in manifest["targets"] if t["variant"] == variant)
+            archive, _ = validate_framework(framework, family)
             actual = subprocess.check_output(["xcrun", "lipo", "-archs", str(archive)], text=True).split()
             require(set(actual) == architectures, f"Wrong library architectures for {variant}")
-            command += ["-library", str(archive), "-headers", str(include)]
+            command += ["-framework", str(framework)]
         subprocess.run([*command, "-output", str(artifact)], check=True)
         with (artifact / "Info.plist").open("rb") as stream:
             entries = plistlib.load(stream)["AvailableLibraries"]
@@ -129,13 +131,16 @@ def assemble(parts, output):
             variant = XCFRAMEWORK_PLATFORMS.get((entry["SupportedPlatform"], entry.get("SupportedPlatformVariant")))
             require(variant in libraries and variant not in seen, "Unexpected assembled platform")
             seen.add(variant)
-            original, _, architectures = libraries[variant]
+            original_framework, _, architectures = libraries[variant]
+            family = next(t["family"] for t in manifest["targets"] if t["variant"] == variant)
+            original, _ = validate_framework(original_framework, family)
             base = artifact / entry["LibraryIdentifier"]
+            binary, include = validate_framework(base / entry["LibraryPath"], family)
             require(set(entry["SupportedArchitectures"]) == architectures
-                    and checksum(base / entry["LibraryPath"]) == checksum(original),
+                    and checksum(binary) == checksum(original),
                     "Assembly changed a verified static library")
-            require(header_hashes(base / entry["HeadersPath"]) == headers,
-                    "Assembly changed verified headers or the module map")
+            require(header_hashes(include) == headers,
+                    "Assembly changed verified headers")
             progress(f"{variant}: assembled library and headers preserved byte-for-byte", "assembly")
         require(seen == set(libraries), "Assembly omitted a platform")
         (artifact / "BuildManifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
