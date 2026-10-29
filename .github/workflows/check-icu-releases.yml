@@ -28,6 +28,7 @@ jobs:
       - name: Update submodule, tag the snapshot, and create a draft release
         id: upstream
         env:
+          PYTHONUNBUFFERED: '1'
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}

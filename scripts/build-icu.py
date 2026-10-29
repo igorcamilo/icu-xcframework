@@ -17,6 +17,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from apple_platforms import PLATFORMS, build_matrix, version
+from job_log import progress, stream_command
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "icu" / "icu4c" / "source"
@@ -32,15 +33,8 @@ def capture(*args):
 
 
 def run(command, cwd, log, env=None):
-    with log.open("w") as stream:
-        stream.write("Command: " + repr([str(a) for a in command]) + "\n")
-        stream.flush()
-        result = subprocess.run(command, cwd=cwd, env=env, stdout=stream,
-                                stderr=subprocess.STDOUT)
-    if result.returncode:
-        print("\n".join(log.read_text(errors="replace").splitlines()[-45:]),
-              file=sys.stderr)
-        raise RuntimeError(f"Command failed; complete log: {log}")
+    label = log.stem if log.stem in ("package", "verify") else f"{log.parent.name}/{log.stem}"
+    stream_command(command, cwd=cwd, env=env, log=log, label=label)
 
 
 def build(directory, env, options, jobs):
@@ -190,6 +184,11 @@ def main():
         "cppflags": "-DU_STATIC_IMPLEMENTATION",
         "data_filter_sha256": hashlib.sha256(filter_bytes).hexdigest() if filter_bytes else None,
     }
+    progress(f"ICU source {config['source_commit']}; {config['xcode'].replace(chr(10), ', ')}", "build")
+    progress(f"Plan: {len(targets)} architecture slices; CPU budget {args.jobs}; "
+             f"up to {args.parallel_builds} concurrent builds", "build")
+    for target in targets:
+        progress(f"{target['variant']}/{target['arch']}: {target['triple']} ({target['sdk']})", "build")
     key = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:20]
     build_root.mkdir(parents=True, exist_ok=True)
     # Serialize users of the same cache; never remove another build's directory.

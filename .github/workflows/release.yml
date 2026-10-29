@@ -27,6 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  PYTHONUNBUFFERED: '1'
   GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
   RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
@@ -55,12 +56,19 @@ jobs:
       - name: Plan independent platform variants
         id: matrix
         run: |
-          python3 -B - <<'PY' >> "$GITHUB_OUTPUT"
+          python3 -B - <<'PY'
           import json
+          import os
           import sys
           sys.path.insert(0, "scripts")
           from apple_platforms import build_matrix
-          print("matrix=" + json.dumps(build_matrix()))
+          from job_log import progress
+          matrix = build_matrix()
+          progress(f"Scheduling {len(matrix['include'])} independent platform jobs", "plan")
+          for entry in matrix["include"]:
+              progress(f"{entry['family']}: {entry['variant']}", "plan")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write("matrix=" + json.dumps(matrix) + "\n")
           PY
 
   build:
@@ -116,16 +124,6 @@ jobs:
           overwrite: true
           compression-level: 1
           retention-days: 1
-      - name: Preserve variant build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-logs-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            build/**/*.log
-            dist/ICU.xcframework/Verification.json
-          if-no-files-found: ignore
-          retention-days: 7
 
   publish:
     needs: [prepare, build]
@@ -158,13 +156,3 @@ jobs:
           options=()
           if [[ "$REBUILD" == "true" ]]; then options+=(--rebuild); fi
           python3 -B scripts/release.py publish --tag "$RELEASE_TAG" "${options[@]}"
-      - name: Preserve build diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: release-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            dist/release-notes.md
-            dist/ICU.xcframework/Verification.json
-          if-no-files-found: ignore
-          retention-days: 7

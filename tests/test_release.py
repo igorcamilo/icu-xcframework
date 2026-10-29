@@ -188,6 +188,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(run.call_args.args,
                              ("gh", "release", "upload", "release-79.1", str(path),
                               "--repo", "owner/repo", "--clobber"))
+            self.assertTrue(run.call_args.kwargs["stream"])
 
     def test_published_release_lookup_does_not_list_releases(self):
         github = release.GitHub()

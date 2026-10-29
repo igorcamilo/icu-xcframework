@@ -72,6 +72,8 @@ Native Mach-O objects are preserved, without LTO or an intermediate `ld -r` link
 Builds are cached under `build/`, keyed by source commit, compiler, SDKs,
 deployment target, flags, architectures, and data-filter contents. Per-stage logs,
 consumer executables and link maps remain in that cache for inspection.
+Configure, compiler, installation, packaging and verification output also streams
+to the terminal as it happens, labeled by architecture/stage with command timings.
 Two architecture builds run concurrently by default and share the entire `--jobs`
 budget, including any remainder when the CPU count is odd. Use
 `--parallel-builds 1` to serialize them. This covers Apple application
@@ -247,8 +249,17 @@ XCFramework. It rejects missing variants, mismatched sources/toolchains, changed
 headers and failed verification results. It checks that assembly preserves every
 static library and header byte-for-byte, and combines the verification reports
 without repeating the consumer builds on a single runner. Variant artifacts are
-kept for one day and reused when retrying only failed jobs; diagnostic logs are
-kept for seven days.
+kept for one day and reused when retrying only failed jobs.
+
+The main job logs show live configure/compiler/install output, verification
+commands and results, native `AlphabeticIndex` results, assembly checks, upload
+progress and the refreshed release notes. Parallel command output is labeled by
+architecture and stage, with elapsed times; long-running build and transfer
+commands print a heartbeat after 30 seconds of silence. Symbol/object inventories
+used for parsing are summarized through their
+commands and check results. There are no separate diagnostic-log artifacts;
+`Verification.json` remains inside the XCFramework, and local build-cache logs
+are still written alongside the live output.
 
 Build and publishing jobs use GitHub's `xcode-27` macOS runner, which includes the
 required Apple SDKs. Set the `MACOS_RUNNER` repository variable to use a different

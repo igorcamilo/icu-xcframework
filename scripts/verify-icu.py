@@ -12,17 +12,17 @@ import subprocess
 import sys
 
 from apple_platforms import XCFRAMEWORK_PLATFORMS, version
+from job_log import progress, stream_command
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests/consumers"
 
 
 def command(*args):
-    result = subprocess.run([str(a) for a in args], stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
-    if result.returncode:
-        raise RuntimeError(f"Command failed: {args}\n{result.stdout}")
-    return result.stdout.strip()
+    # Keep machine-readable symbol/object inventories out of the console, but
+    # print their commands and every compiler diagnostic/runtime test message.
+    inspection = len(args) > 1 and str(args[1]) in ("nm", "otool", "ar", "lipo", "--sdk")
+    return stream_command(args, label="check", capture=True, show_output=not inspection)
 
 
 def require(condition, message):
@@ -61,6 +61,7 @@ def main():
     require(len(available) == len({t["variant"] for t in manifest["targets"]}),
             "Unexpected count of platform libraries")
     expected = {(t["variant"], t["arch"]) for t in manifest["targets"]}
+    progress(f"Verifying {len(expected)} architecture slices from ICU {manifest['source_commit']}", "verify")
     found = set()
     simulator_programs = {}
     for library in available:
@@ -75,12 +76,15 @@ def main():
                 "Packaged public headers differ from the unmodified upstream headers")
         require(all(name.startswith("unicode/") for name in packaged_headers),
                 "Custom public headers must not be packaged")
+        progress(f"{len(packaged_headers)} public headers match upstream byte-for-byte", variant)
         require(archive.suffix == ".a", "Expected a static archive")
         major = re.search(r"^#define U_ICU_VERSION_MAJOR_NUM (\d+)$",
                           (headers / "unicode/uvernum.h").read_text(), re.M).group(1)
         actual_archs = set(command("xcrun", "lipo", "-archs", archive).split())
         require(actual_archs == set(library["SupportedArchitectures"]), "XCFramework architecture metadata mismatch")
         for arch in sorted(actual_archs):
+            label = f"{variant}/{arch}"
+            progress("Checking platform, deployment target, archive members and static data", label)
             found.add((variant, arch))
             target = next((t for t in manifest["targets"]
                            if (t["variant"], t["arch"]) == (variant, arch)), None)
@@ -104,6 +108,7 @@ def main():
             minimums = re.findall(r"\bminos\s+(\S+)", metadata)
             require(minimums and all(version(v) == version(target["minimum_os"]) for v in minimums),
                     "Inconsistent minimum deployment target")
+            progress("Extracting ustring.ao to inspect function-level stripping metadata", label)
             with (directory / "ustring.o").open("wb") as stream:
                 subprocess.run(["xcrun", "ar", "-p", str(thin), "ustring.ao"], stdout=stream, check=True)
             require("SUBSECTIONS_VIA_SYMBOLS" in command("xcrun", "otool", "-hv", directory / "ustring.o"),
@@ -112,6 +117,7 @@ def main():
             flags = ["-target", target["triple"], "-isysroot", sdk, "-Os",
                      "-DU_STATIC_IMPLEMENTATION", "-I", str(headers)]
             sizes = {}
+            progress("Linking C consumers and checking dead-code stripping", label)
             for fixture, strip in (("empty", True), ("string", True), ("string", False)):
                 name = fixture + ("-strip" if strip else "-no-strip")
                 binary = directory / name
@@ -131,6 +137,9 @@ def main():
                 require(not any("AlphabeticIndex" in s for s in names), "Unused AlphabeticIndex retained")
                 sizes[name] = binary.stat().st_size
             require(sizes["string-strip"] < sizes["string-no-strip"], "Stripping did not reduce executable size")
+            progress(f"Dead stripping passed: {sizes['string-strip']} bytes stripped, "
+                     f"{sizes['string-no-strip']} bytes unstripped", label)
+            progress("Linking upstream C++ APIs, feature smoke tests and AlphabeticIndex", label)
             for name in ("cpp", "smoke", "alphabetic-index"):
                 command("xcrun", "clang++", "-std=c++17", *flags, FIXTURES / f"{name}.cpp",
                         thin, "-Wl,-dead_strip", "-o", directory / name)
@@ -140,6 +149,7 @@ def main():
             require("_icudt" + major + "_dat" in symbols(directory / "alphabetic-index"),
                     "AlphabeticIndex consumer is missing packaged collation/locale data")
             swift_source = directory / "import.swift"
+            progress("Linking Swift + Foundation and Swift C++ interoperability consumers", label)
             swift_source.write_text((FIXTURES / "import.swift.in").read_text().replace("@ICU_MAJOR@", major))
             command("xcrun", "swiftc", "-target", target["triple"], "-sdk", sdk, "-O",
                     "-Xcc", "-DU_STATIC_IMPLEMENTATION",
@@ -163,6 +173,7 @@ def main():
             if variant.endswith("-simulator"):
                 simulator_programs[(variant, arch)] = directory
             if variant in ("macos", "maccatalyst") and arch == platform.machine():
+                progress("Running packaged C/C++/Swift and AlphabeticIndex consumers", label)
                 for name in ("string-strip", "cpp", "swift", "swift-cpp", "smoke", "alphabetic-index"):
                     if name in ("smoke", "alphabetic-index") and manifest["data_filter_sha256"]:
                         continue
@@ -170,10 +181,12 @@ def main():
                     if "alphabetic-index" in name:
                         report["alphabetic_index_runtime"][variant + "-" + name] = result.splitlines()
                 report[variant + "_runtime"] = "passed on packaged " + arch + " slice"
+            progress("PASS: metadata, upstream headers, static data, C/C++/Swift, AlphabeticIndex and stripping", label)
 
     require(found == expected, "Missing or extra platform/architecture slices")
     headers = artifact / available[0]["LibraryIdentifier"] / available[0]["HeadersPath"]
     if args.host_build:
+        progress("Running native C/C++/Swift, feature smoke tests and AlphabeticIndex", "native")
         native = work / "native"
         native.mkdir(exist_ok=True)
         host = args.host_build.resolve()
@@ -204,7 +217,9 @@ def main():
         command(native / "swift-cpp")
         report["native_runtime"] = "C/C++/Swift passed; " + (
             "broad smoke skipped for custom data filter" if manifest["data_filter_sha256"] else "all feature smoke tests passed")
+        progress(report["native_runtime"], "native")
     for udid in args.simulator_udid:
+        progress(f"Running consumers in Simulator {udid}", "verify")
         arch = command("xcrun", "simctl", "getenv", udid, "SIMULATOR_ARCHS")
         devices = json.loads(command("xcrun", "simctl", "list", "devices", "-j"))["devices"]
         runtime = next((key for key, values in devices.items() if any(d["udid"] == udid for d in values)), "")
@@ -221,6 +236,7 @@ def main():
                 report["alphabetic_index_runtime"][str(family) + "-" + name] = result.splitlines()
         report["simulator_runtime"][udid] = "passed on " + str(family)
     (work / "results.json").write_text(json.dumps(report, indent=2) + "\n")
+    progress(f"All {len(report['slices'])} slices passed; report: {work / 'results.json'}", "verify")
     print(json.dumps(report, indent=2))
 
 

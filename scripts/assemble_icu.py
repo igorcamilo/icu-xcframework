@@ -12,6 +12,7 @@ import tempfile
 
 from apple_platforms import XCFRAMEWORK_PLATFORMS, build_matrix
 from release import checksum, validate_artifact
+from job_log import progress
 
 COMMON_FIELDS = (
     "builder", "recipe", "source_commit", "xcode", "compiler", "options", "cflags",
@@ -32,6 +33,7 @@ def header_hashes(directory):
 def collect(parts):
     manifests = sorted(parts.glob("*/ICU.xcframework/BuildManifest.json"))
     require(manifests, "No per-variant XCFramework artifacts found")
+    progress(f"Validating {len(manifests)} downloaded platform parts", "assembly")
     combined = None
     report = {"slices": [], "alphabetic_index_runtime": {}, "simulator_runtime": {}}
     libraries = {}
@@ -76,6 +78,7 @@ def collect(parts):
         require(inventory == expected_headers and (artifact / "LICENSE").read_bytes() == license_bytes,
                 "Part headers, module maps or licenses disagree")
         libraries[variant] = (archive, headers, architectures)
+        progress(f"{variant}: {', '.join(sorted(architectures))}; headers and verification report validated", "assembly")
         combined["targets"].extend(targets)
         for key in ("sdks", "minimum_versions"):
             for name, value in manifest[key].items():
@@ -133,6 +136,7 @@ def assemble(parts, output):
                     "Assembly changed a verified static library")
             require(header_hashes(base / entry["HeadersPath"]) == headers,
                     "Assembly changed verified headers or the module map")
+            progress(f"{variant}: assembled library and headers preserved byte-for-byte", "assembly")
         require(seen == set(libraries), "Assembly omitted a platform")
         (artifact / "BuildManifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         (artifact / "Verification.json").write_text(json.dumps(report, indent=2) + "\n")

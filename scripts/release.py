@@ -8,12 +8,15 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import tempfile
+import time
 from urllib.parse import quote
 import zipfile
 
 from apple_platforms import PLATFORMS
+from job_log import progress, stream_command
 
 UPSTREAM = "unicode-org/icu"
 ARCHIVE = "ICU.xcframework.zip"
@@ -25,16 +28,26 @@ VARIANTS = {variant for settings in PLATFORMS.values() for variant, _, _, _ in s
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def run(*args, cwd=ROOT):
+def run(*args, cwd=ROOT, stream=False):
+    if stream:
+        return stream_command(args, cwd=cwd, label="release")
+    progress("START $ " + shlex.join([str(arg) for arg in args]))
+    started = time.monotonic()
     result = subprocess.run([str(a) for a in args], cwd=cwd, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode:
+        progress(f"FAILED: exit {result.returncode} after {time.monotonic() - started:.1f}s")
         raise RuntimeError(f"Command failed: {args}\n{result.stderr}")
+    if result.stderr:
+        progress(result.stderr)
+    progress(f"DONE in {time.monotonic() - started:.1f}s")
     return result.stdout.strip()
 
 
 class GitHub:
     def api(self, endpoint, method="GET", data=None, missing_ok=False):
+        progress(f"GitHub {method} {endpoint}")
+        started = time.monotonic()
         args = ["gh", "api", "--method", method, endpoint]
         if data is not None:
             args += ["--input", "-"]
@@ -42,8 +55,10 @@ class GitHub:
                                 text=True, capture_output=True)
         if result.returncode:
             if missing_ok and "HTTP 404" in result.stderr:
+                progress("GitHub: release/ref not found; continuing")
                 return None
             raise RuntimeError(f"GitHub API failed for {endpoint}: {result.stderr}")
+        progress(f"GitHub {method} completed in {time.monotonic() - started:.1f}s")
         return json.loads(result.stdout) if result.stdout.strip() else None
 
     def releases(self, repository):
@@ -81,11 +96,12 @@ class GitHub:
 
     def upload(self, repository, tag, path, replace=False):
         options = ["--clobber"] if replace else []
-        run("gh", "release", "upload", tag, str(path), "--repo", repository, *options)
+        progress(f"{'Replacing' if replace else 'Uploading'} {path.name} ({path.stat().st_size:,} bytes) for {tag}")
+        run("gh", "release", "upload", tag, str(path), "--repo", repository, *options, stream=True)
 
     def download(self, repository, tag, name, directory):
         run("gh", "release", "download", tag, "--repo", repository,
-            "--pattern", name, "--dir", str(directory))
+            "--pattern", name, "--dir", str(directory), stream=True)
         return directory / name
 
 
@@ -148,16 +164,20 @@ def check_upstream(github, repository, branch, rebuild=False):
     tag = upstream["tag_name"]
     pinned_sha = run("git", "rev-parse", "HEAD:icu")
     current_version = icu_version(pinned_sha, github)
+    progress(f"Current pin: ICU {current_version} ({pinned_sha}); latest stable release: {tag}")
     current = release_version("release-" + current_version)
     if release_version(tag) < current:
+        progress("Keeping the newer pinned version; nothing to publish")
         outputs(tag=tag, publish="false")
         return
     existing = github.release(repository, tag)
     if not rebuild and release_version(tag) == current and existing and complete(existing):
+        progress("Release is complete; no rebuild requested")
         outputs(tag=tag, publish="false")
         return
 
     source_sha = github.tag_commit(UPSTREAM, tag)
+    progress(f"Selected upstream commit: {source_sha}; rebuild requested: {rebuild}")
     version = current_version if source_sha == pinned_sha else icu_version(source_sha, github)
     if release_version("release-" + version) != release_version(tag):
         raise RuntimeError("Upstream tag and ICU version header disagree")
@@ -169,20 +189,25 @@ def check_upstream(github, repository, branch, rebuild=False):
     if changed not in (0, 1):
         raise RuntimeError("Cannot inspect the staged submodule update")
     if changed:
+        progress(f"Committing ICU gitlink update: {message}")
         run("git", "-c", "user.name=github-actions[bot]", "-c",
             "user.email=41898282+github-actions[bot]@users.noreply.github.com",
-            "commit", "-m", message)
+            "commit", "-m", message, stream=True)
         # A concurrent branch update fails instead of force-pushing over it.
-        run("git", "push", "origin", f"HEAD:refs/heads/{branch}")
+        run("git", "push", "origin", f"HEAD:refs/heads/{branch}", stream=True)
+    else:
+        progress("ICU gitlink is unchanged; no commit needed")
 
     # Create the Git tag explicitly; a draft release alone need not create it.
     reference = github.api(f"repos/{repository}/git/ref/tags/{quote(tag, safe='')}", missing_ok=True)
     if reference:
+        progress(f"Checking existing repository tag {tag}")
         if github.submodule_commit(repository, tag) != source_sha:
             raise RuntimeError("Existing release tag pins a different ICU revision; refusing to move it")
     else:
+        progress(f"Creating repository tag {tag}")
         run("git", "tag", tag, "HEAD")
-        run("git", "push", "origin", f"refs/tags/{tag}")
+        run("git", "push", "origin", f"refs/tags/{tag}", stream=True)
     if not existing:
         github.api(f"repos/{repository}/releases", "POST", {
             "tag_name": tag, "target_commitish": run("git", "rev-parse", "HEAD"),
@@ -213,6 +238,7 @@ def validate_artifact(manifest, verification, source_sha):
 
 
 def bundle(artifact, archive, source_sha):
+    progress(f"Validating and packaging {artifact} into {archive.name}")
     if artifact.name != "ICU.xcframework":
         raise RuntimeError("The release artifact must be named ICU.xcframework")
     manifest = json.loads((artifact / "BuildManifest.json").read_text())
@@ -223,7 +249,10 @@ def bundle(artifact, archive, source_sha):
             if path.is_symlink():
                 raise RuntimeError(f"Unexpected symlink in the release artifact: {path}")
             if path.is_file():
+                if path.suffix == ".a":
+                    progress(f"Compressing {path.relative_to(artifact)} ({path.stat().st_size:,} bytes)")
                 target.write(path, path.relative_to(artifact.parent).as_posix())
+    progress(f"ZIP ready: {archive.stat().st_size:,} bytes")
 
 
 def checksum(path):
@@ -275,6 +304,7 @@ def publish(github, repository, tag, artifact, directory, rebuild=False):
         raise RuntimeError("Create the repository release before publishing its artifact")
     source_sha = github.submodule_commit(repository, tag)
     version = icu_version(source_sha, github)
+    progress(f"Publishing ICU {version} ({source_sha}) to {repository}/{tag}; replace assets: {rebuild}")
     candidates = [r for r in github.releases(UPSTREAM)
                   if release_version(r["tag_name"]) == release_version("release-" + version)
                   and not r["draft"] and not r["prerelease"]]
@@ -288,6 +318,7 @@ def publish(github, repository, tag, artifact, directory, rebuild=False):
     with tempfile.TemporaryDirectory(prefix="icu-release-", dir=directory) as temporary:
         staging = Path(temporary)
         if ARCHIVE in names and not rebuild:
+            progress("Reusing and validating the existing release archive")
             archive = github.download(repository, tag, ARCHIVE, staging)
             with zipfile.ZipFile(archive) as existing:
                 validate_artifact(json.loads(existing.read("ICU.xcframework/BuildManifest.json")),
@@ -296,6 +327,7 @@ def publish(github, repository, tag, artifact, directory, rebuild=False):
             archive = staging / ARCHIVE
             bundle(artifact, archive, source_sha)
         digest = checksum(archive)
+        progress(f"Archive SHA-256: {digest}; checking against SwiftPM")
         # Check SwiftPM's own checksum implementation against the value in the snippet.
         if run("swift", "package", "compute-checksum", archive, cwd=staging) != digest:
             raise RuntimeError("SwiftPM checksum disagrees with the archive SHA-256")
@@ -312,9 +344,11 @@ def publish(github, repository, tag, artifact, directory, rebuild=False):
         # Only publish drafts after both uploads; preserve manually written release text.
         current = github.release(repository, tag)
         body = release_notes(repository, tag, upstream, digest, current.get("body"))
+        progress(f"Updating release title to ICU {version} and refreshing release notes")
         github.api(f"repos/{repository}/releases/{current['id']}", "PATCH",
                    {"name": f"ICU {version}", "body": body, "draft": False})
         (directory / "release-notes.md").write_text(body)
+        progress(body, "release notes")
         print(f"Published {repository} {tag}: {digest}")
 
 
